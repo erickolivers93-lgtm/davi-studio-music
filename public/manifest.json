@@ -1,0 +1,16 @@
+{
+  "short_name": "DAVI Studio",
+  "name": "DAVI Studio AI - Audio & Stem Player",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "type": "image/svg+xml",
+      "sizes": "192x192 512x512"
+    }
+  ],
+  "start_url": "/",
+  "background_color": "#090D0B",
+  "theme_color": "#090D0B",
+  "display": "standalone",
+  "orientation": "any"
+}
