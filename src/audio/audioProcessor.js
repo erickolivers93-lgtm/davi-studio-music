@@ -3,6 +3,67 @@ import { analyzeHarmonicKeyAndChords } from './keyDetector';
 import { inMemoryStemsCache } from './audioStorage';
 
 /**
+ * Decodifica com segurança um ArrayBuffer de áudio.
+ * Utiliza OfflineAudioContext para NUNCA travar no iOS Safari (dispensa ativação por gesto de hardware).
+ */
+export async function safeDecodeAudioData(ctx, arrayBuffer) {
+  // Clona o arrayBuffer para evitar que seja desconectado
+  const bufferCopy = arrayBuffer.slice(0);
+
+  // Cria um contexto offline leve para decodificar sem depender do estado do hardware
+  const OfflineCtxClass = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  let decodeEngine = null;
+
+  try {
+    if (OfflineCtxClass) {
+      decodeEngine = new OfflineCtxClass(1, 44100, 44100);
+    }
+  } catch (_) {}
+
+  // Fallback para o contexto passado ou novo AudioContext se offline falhar
+  if (!decodeEngine) {
+    decodeEngine = ctx || new (window.AudioContext || window.webkitAudioContext)();
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    // Timeout de segurança de 12 segundos para NUNCA travar a tela infinitamente
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        reject(new Error('Tempo de decodificação excedido. Verifique o arquivo de áudio.'));
+      }
+    }, 12000);
+
+    const onDecoded = (decoded) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        resolve(decoded);
+      }
+    };
+
+    const onError = (err) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(new Error('Formato de áudio não suportado ou arquivo corrompido.'));
+      }
+    };
+
+    try {
+      const res = decodeEngine.decodeAudioData(bufferCopy, onDecoded, onError);
+      if (res && typeof res.then === 'function') {
+        res.then(onDecoded).catch(onError);
+      }
+    } catch (err) {
+      onError(err);
+    }
+  });
+}
+
+/**
  * Garante que os stems de áudio de uma música estejam decodificados e prontos em memória.
  * Se a página foi recarregada, restaura instantaneamente a partir do audioBlob no IndexedDB.
  */
@@ -34,67 +95,6 @@ export async function ensureSongStemsLoaded(ctx, song) {
 }
 
 /**
- * Decodifica com segurança um ArrayBuffer de áudio em qualquer navegador (Chrome, Safari, Firefox, iOS, Android)
- * Trata casos de compatibilidade com chamadas baseadas em Callback e Promise.
- */
-export async function safeDecodeAudioData(ctx, arrayBuffer) {
-  if (!ctx) throw new Error('AudioContext não disponível');
-
-  if (ctx.state === 'suspended' || ctx.state === 'interrupted') {
-    try {
-      await ctx.resume();
-    } catch (_) {}
-  }
-
-  // Clona o arrayBuffer para evitar mutação/desconexão
-  const bufferCopy = arrayBuffer.slice(0);
-
-  return new Promise((resolve, reject) => {
-    let settled = false;
-
-    // Tentativa com callbacks legados (estilo Safari iOS) e Promise moderna
-    try {
-      const promise = ctx.decodeAudioData(
-        bufferCopy,
-        (decoded) => {
-          if (!settled) {
-            settled = true;
-            resolve(decoded);
-          }
-        },
-        (err) => {
-          if (!settled) {
-            settled = true;
-            reject(new Error('Falha ao decodificar arquivo de áudio. O formato pode estar corrompido ou incompatível.'));
-          }
-        }
-      );
-
-      if (promise && typeof promise.then === 'function') {
-        promise
-          .then((decoded) => {
-            if (!settled) {
-              settled = true;
-              resolve(decoded);
-            }
-          })
-          .catch((err) => {
-            if (!settled) {
-              settled = true;
-              reject(err);
-            }
-          });
-      }
-    } catch (err) {
-      if (!settled) {
-        settled = true;
-        reject(err);
-      }
-    }
-  });
-}
-
-/**
  * Baixa um arquivo de áudio de uma URL externa e decodifica no Web Audio API
  */
 export async function fetchAndDecodeAudio(ctx, audioUrl) {
@@ -121,11 +121,14 @@ export async function fetchAndDecodeAudio(ctx, audioUrl) {
 /**
  * Processa um AudioBuffer decodificado:
  * 1. Detecta o BPM e o compasso
- * 2. Analisa a TONALIDADE REAL (Key) e a PROGRESSÃO DE ACORDES via Krumhansl-Schmuckler
+ * 2. Analisa a TONALIDADE REAL (Key) e a PROGRESSÃO DE ACORDES via Krumhansl-Schmuckler (< 10ms)
  * 3. Executa a separação DSP Mid-Side em 4 stems reais (Vocais, Bateria, Baixo, Harmonia) + Smart Metrônomo
  * 4. Retorna a música com todas as formas de onda (peaks) e o blob binário para persistência.
  */
 export async function processAudioBufferIntoSong(ctx, decodedBuffer, meta = {}, rawAudioBlob = null) {
+  // Permite à interface do navegador renderizar animações
+  await new Promise((r) => setTimeout(r, 20));
+
   // 1. Separação de canais e detecção de BPM
   const { detectedBpm, stems } = await separateLocalAudioBufferClientSide(ctx, decodedBuffer);
 

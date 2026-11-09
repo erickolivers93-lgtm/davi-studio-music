@@ -73,8 +73,9 @@ export const ImportModal = ({
           </div>
           <button
             type="button"
-            onClick={() => !isProcessingImport && setShowImportModal(false)}
-            className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800"
+            onClick={() => setShowImportModal(false)}
+            className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors"
+            title="Fechar"
           >
             <X className="w-5 h-5" />
           </button>
@@ -137,15 +138,22 @@ export const ImportModal = ({
 
         {/* Estado de Processamento Ativo */}
         {isProcessingImport ? (
-          <div className="py-8 text-center space-y-3.5">
+          <div className="py-8 text-center space-y-4">
             <RefreshCw className="w-10 h-10 text-emerald-400 animate-spin mx-auto" />
             <div className="space-y-1">
               <h4 className="text-sm font-bold text-white">Processando Áudio & Separando Stems</h4>
-              <p className="text-xs text-emerald-300 font-medium">{processingStep}</p>
+              <p className="text-xs text-emerald-300 font-semibold">{processingStep || 'Inicializando...'}</p>
             </div>
             <p className="text-[11px] text-slate-400 max-w-sm mx-auto">
               Decodificando frequências, isolando vocais/bateria/baixo/harmonia e sincronizando metrônomo...
             </p>
+            <button
+              type="button"
+              onClick={() => setShowImportModal(false)}
+              className="mt-2 px-4 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition-colors"
+            >
+              Cancelar
+            </button>
           </div>
         ) : (
           <div className="flex-1 overflow-y-auto space-y-3 pr-1">

@@ -513,20 +513,20 @@ export default function App() {
     if (!file) return;
 
     setIsProcessingImport(true);
-    setProcessingStep('Lendo arquivo de áudio e inicializando decodificador...');
+    setProcessingStep('1/4 • Lendo arquivo de áudio...');
+    await new Promise((r) => setTimeout(r, 40));
 
     try {
       const ctx = ensureAudioContext();
-      if (ctx.state === 'suspended') {
-        await ctx.resume().catch(() => {});
-      }
 
-      setProcessingStep('Decodificando áudio no navegador...');
+      setProcessingStep('2/4 • Decodificando áudio no navegador...');
+      await new Promise((r) => setTimeout(r, 40));
       const arrayBuf = await file.arrayBuffer();
       const rawBlob = new Blob([arrayBuf], { type: file.type || 'audio/mpeg' });
       const decoded = await safeDecodeAudioData(ctx, arrayBuf);
 
-      setProcessingStep('Separando 4 stems DSP e detectando tonalidade real...');
+      setProcessingStep('3/4 • Separando 4 stems e detectando tom real...');
+      await new Promise((r) => setTimeout(r, 40));
       const existing = targetSongId ? songs.find((s) => s.id === targetSongId) : null;
       const songId = targetSongId || `local-${Date.now()}`;
       const songTitle = existing ? existing.title : file.name.replace(/\.[^/.]+$/, '');
@@ -544,6 +544,9 @@ export default function App() {
         },
         rawBlob
       );
+
+      setProcessingStep('4/4 • Salvando na biblioteca...');
+      await new Promise((r) => setTimeout(r, 40));
 
       // Atualiza lista de músicas
       setSongs((prev) => {
@@ -567,6 +570,7 @@ export default function App() {
     } catch (err) {
       console.error('Erro no upload local:', err);
       showToast(err.message || 'Erro ao decodificar arquivo de áudio');
+      setShowImportModal(false);
     } finally {
       setIsProcessingImport(false);
       setProcessingStep('');
@@ -576,19 +580,18 @@ export default function App() {
   // Importação direta de áudio por URL (MP3/WAV da Web ou download do Y2Mate)
   const handleAudioUrlImport = async (audioUrl) => {
     setIsProcessingImport(true);
-    setProcessingStep('Baixando áudio da URL...');
+    setProcessingStep('1/3 • Baixando áudio da URL...');
+    await new Promise((r) => setTimeout(r, 40));
 
     try {
       const ctx = ensureAudioContext();
-      if (ctx.state === 'suspended') {
-        await ctx.resume().catch(() => {});
-      }
 
       const { decoded, audioBlob } = await fetchAndDecodeAudio(ctx, audioUrl);
       const urlFileName = audioUrl.split('/').pop().split('?')[0] || 'Áudio Remoto';
       const cleanTitle = decodeURIComponent(urlFileName).replace(/\.[^/.]+$/, '');
 
-      setProcessingStep('Separando stems e detectando tom real...');
+      setProcessingStep('2/3 • Separando stems e detectando tom real...');
+      await new Promise((r) => setTimeout(r, 40));
       const newSong = await processAudioBufferIntoSong(
         ctx,
         decoded,
@@ -598,6 +601,9 @@ export default function App() {
         },
         audioBlob
       );
+
+      setProcessingStep('3/3 • Salvando na biblioteca...');
+      await new Promise((r) => setTimeout(r, 40));
 
       setSongs((prev) => [newSong, ...prev.filter((s) => s.id !== newSong.id)]);
       await saveTrackToDB(newSong);
@@ -614,6 +620,7 @@ export default function App() {
     } catch (err) {
       console.error('Erro no download por URL:', err);
       showToast(err.message || 'Erro ao baixar arquivo de áudio da URL');
+      setShowImportModal(false);
     } finally {
       setIsProcessingImport(false);
       setProcessingStep('');
@@ -632,14 +639,14 @@ export default function App() {
     if (!file) return;
 
     setIsProcessingImport(true);
-    setProcessingStep('Decodificando MP3 e vinculando ao vídeo do YouTube...');
+    setProcessingStep('1/3 • Lendo MP3 baixado...');
+    await new Promise((r) => setTimeout(r, 40));
 
     try {
       const ctx = ensureAudioContext();
-      if (ctx.state === 'suspended') {
-        await ctx.resume().catch(() => {});
-      }
 
+      setProcessingStep('2/3 • Decodificando áudio...');
+      await new Promise((r) => setTimeout(r, 40));
       const arrayBuf = await file.arrayBuffer();
       const rawBlob = new Blob([arrayBuf], { type: file.type || 'audio/mpeg' });
       const decoded = await safeDecodeAudioData(ctx, arrayBuf);
@@ -647,7 +654,8 @@ export default function App() {
       const songId = `yt-${ytPreview?.id || Date.now()}`;
       const songTitle = file.name.replace(/\.[^/.]+$/, '');
 
-      setProcessingStep('Separando faixas e detectando tom da música...');
+      setProcessingStep('3/3 • Separando faixas e detectando tom da música...');
+      await new Promise((r) => setTimeout(r, 40));
       const newSong = await processAudioBufferIntoSong(
         ctx,
         decoded,
@@ -676,6 +684,7 @@ export default function App() {
     } catch (err) {
       console.error('Erro ao processar MP3:', err);
       showToast(err.message || 'Erro ao processar arquivo MP3');
+      setShowImportModal(false);
     } finally {
       setIsProcessingImport(false);
       setProcessingStep('');
