@@ -26,6 +26,10 @@ export const HeaderHUD = ({
   playbackSpeed,
   setPlaybackSpeed,
   currentBpm,
+  baseBpm,
+  onChangeBpm,
+  onTapTempo,
+  onSyncMetronome,
   countInBars,
   setCountInBars,
   setShowImportModal,
@@ -102,19 +106,45 @@ export const HeaderHUD = ({
         <div className="flex items-center bg-[#14201A] border border-emerald-800/60 rounded-xl px-2.5 py-1 gap-2 shadow-inner">
           <div>
             <span className="text-[8px] uppercase tracking-wider text-slate-400 block font-semibold leading-none">
-              BPM ({Math.round(playbackSpeed * 100)}%)
+              BPM Real: {baseBpm || currentBpm}
             </span>
             <span className="text-xs font-black text-emerald-400 leading-tight">
-              {currentBpm} <span className="text-[9px] font-semibold text-slate-400">BPM</span>
+              {currentBpm} <span className="text-[9px] font-semibold text-slate-400">({Math.round(playbackSpeed * 100)}%)</span>
             </span>
           </div>
           <div className="flex items-center gap-0.5">
             <button
               type="button"
+              onClick={() => onChangeBpm && onChangeBpm((baseBpm || currentBpm) - 1)}
+              className="w-5 h-6 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-bold"
+              title="Diminuir 1 BPM da música"
+            >
+              -1
+            </button>
+            <button
+              type="button"
+              onClick={() => onChangeBpm && onChangeBpm((baseBpm || currentBpm) + 1)}
+              className="w-5 h-6 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-bold"
+              title="Aumentar 1 BPM da música"
+            >
+              +1
+            </button>
+            <button
+              type="button"
+              onClick={onTapTempo}
+              className="px-1.5 h-6 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 text-[9px] font-extrabold"
+              title="Tap Tempo (toque 4x para calcular o BPM)"
+            >
+              TAP
+            </button>
+            <div className="w-[1px] h-4 bg-slate-700 mx-0.5" />
+            <button
+              type="button"
               onClick={() =>
                 setPlaybackSpeed((v) => Math.max(0.5, Math.round((v - 0.05) * 100) / 100))
               }
-              className="w-6 h-6 rounded-lg bg-slate-800 hover:bg-emerald-500/20 hover:text-emerald-300 flex items-center justify-center text-slate-200 border border-slate-700"
+              className="w-5 h-6 rounded bg-slate-800 hover:bg-emerald-500/20 text-slate-200 flex items-center justify-center"
+              title="Diminuir velocidade"
             >
               <ChevronDown className="w-3 h-3" />
             </button>
@@ -122,7 +152,8 @@ export const HeaderHUD = ({
               type="button"
               onClick={() => setPlaybackSpeed(1.0)}
               disabled={playbackSpeed === 1.0}
-              className="px-1.5 h-6 rounded-lg bg-slate-800/70 hover:bg-slate-700 disabled:opacity-40 text-[9px] font-bold text-slate-300"
+              className="px-1 h-6 rounded bg-slate-800/70 hover:bg-slate-700 disabled:opacity-40 text-[9px] font-bold text-slate-300"
+              title="Velocidade normal 100%"
             >
               1x
             </button>
@@ -131,7 +162,8 @@ export const HeaderHUD = ({
               onClick={() =>
                 setPlaybackSpeed((v) => Math.min(1.5, Math.round((v + 0.05) * 100) / 100))
               }
-              className="w-6 h-6 rounded-lg bg-slate-800 hover:bg-emerald-500/20 hover:text-emerald-300 flex items-center justify-center text-slate-200 border border-slate-700"
+              className="w-5 h-6 rounded bg-slate-800 hover:bg-emerald-500/20 text-slate-200 flex items-center justify-center"
+              title="Aumentar velocidade"
             >
               <ChevronUp className="w-3 h-3" />
             </button>

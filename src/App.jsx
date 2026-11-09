@@ -14,6 +14,7 @@ import {
   extractPeaks,
   fastSin
 } from './audio/audioEngine';
+import { generateMetronomeBuffer } from './audio/dspSeparator';
 import {
   safeDecodeAudioData,
   fetchAndDecodeAudio,
@@ -88,6 +89,8 @@ export default function App() {
 
   // Referência para input de substituição rápida de MP3 no estúdio
   const replaceAudioInputRef = useRef(null);
+  const iosAudioUnlockerRef = useRef(null);
+  const tapTimesRef = useRef([]);
 
   // Estado individual das 5 faixas (Stems + Smart Metrônomo)
   const [trackStates, setTrackStates] = useState({
@@ -95,7 +98,7 @@ export default function App() {
     drums:     { volume: 1.0, pan: 0, muted: false, solo: false },
     bass:      { volume: 1.0, pan: 0, muted: false, solo: false },
     other:     { volume: 1.0, pan: 0, muted: false, solo: false },
-    metronome: { volume: 0.65, pan: 0, muted: true,  solo: false }
+    metronome: { volume: 0.90, pan: 0, muted: true,  solo: false }
   });
 
   // Referências para o motor Web Audio API e sincronismo sem closures obsoletas
@@ -220,9 +223,23 @@ export default function App() {
 
   /**
    * Cria ou desbloqueia o AudioContext de forma SÍNCRONA dentro do clique/toque do usuário.
-   * Essencial para o iOS Safari quando o usuário sai da aba/app e volta.
+   * Desbloqueia o modo 'playback' no iOS Safari para que o som saia pelo alto-falante mesmo no modo silencioso.
    */
   const ensureAudioContext = useCallback((unlockWithSilentPulse = false) => {
+    // 1. Configura a sessão de áudio do iOS para Playback (ignora chave silenciosa/fones)
+    if (typeof navigator !== 'undefined' && 'audioSession' in navigator) {
+      try {
+        navigator.audioSession.type = 'playback';
+      } catch (_) {}
+    }
+
+    // 2. Aciona o elemento HTML5 Audio para forçar a rota de áudio ao alto-falante no iOS
+    if (unlockWithSilentPulse && iosAudioUnlockerRef.current) {
+      try {
+        iosAudioUnlockerRef.current.play().catch(() => {});
+      } catch (_) {}
+    }
+
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
       audioCtxRef.current = new AudioContextClass();
@@ -258,6 +275,11 @@ export default function App() {
       } catch (_) {}
     });
     activeNodesRef.current = {};
+    if (iosAudioUnlockerRef.current) {
+      try {
+        iosAudioUnlockerRef.current.pause();
+      } catch (_) {}
+    }
   }, []);
 
   // Quando o usuário sai da página/minimiza o navegador no celular e volta,
@@ -488,6 +510,12 @@ export default function App() {
       setCurrentTime(clampedOffset);
       setIsPlaying(true);
 
+      if (iosAudioUnlockerRef.current) {
+        try {
+          iosAudioUnlockerRef.current.play().catch(() => {});
+        } catch (_) {}
+      }
+
       const updateLoop = () => {
         if (!audioCtxRef.current) return;
         const rawElapsed = audioCtxRef.current.currentTime - playStartCtxTimeRef.current;
@@ -606,53 +634,81 @@ export default function App() {
     });
   };
 
-  // Ressincroniza a Batida 1 do Smart Metrônomo exatamente no segundo atual (caso o usuário queira ajustar o clique na mão)
-  const handleSyncMetronomeHere = () => {
+  // Ajusta o BPM base da música e recalcula instantaneamente o metrônomo calibrado
+  const handleChangeSongBpm = (newBpm) => {
+    const safeBpm = Math.max(40, Math.min(260, Math.round(newBpm)));
     const ctx = ensureAudioContext(true);
-    const beatSec = 60 / (activeSong.bpm || 120);
-    const newOffset = currentTime % beatSec;
-    const duration = activeSong.duration || 32;
-    const sr = ctx.sampleRate || 44100;
-    const len = Math.floor(duration * sr);
-    const metroBuf = ctx.createBuffer(2, len, sr);
-    const mL = metroBuf.getChannelData(0);
-    const mR = metroBuf.getChannelData(1);
-
-    const newBeatTimes = [];
-    for (let b = 0; ; b++) {
-      const t = newOffset + b * beatSec;
-      if (t >= duration) break;
-      newBeatTimes.push(t);
-    }
-
-    // Marca como tempo 1 a batida mais próxima do currentTime
-    const currentBeatIdx = Math.round((currentTime - newOffset) / beatSec);
-
-    for (let b = 0; b < newBeatTimes.length; b++) {
-      const start = Math.floor(newBeatTimes[b] * sr);
-      if (start >= len) break;
-      const isDownbeat = ((b - currentBeatIdx) % 4 + 4000) % 4 === 0;
-      const freq = isDownbeat ? 1480 : 987.77;
-      const clickLen = Math.min(Math.floor(0.045 * sr), len - start);
-      for (let k = 0; k < clickLen; k++) {
-        const kt = k / sr;
-        const val =
-          fastSin(2 * Math.PI * freq * kt) *
-          Math.exp(-kt * 85) *
-          (isDownbeat ? 0.75 : 0.52);
-        mL[start + k] = val;
-        mR[start + k] = val;
-      }
-    }
-
-    const newMetroStem = { buffer: metroBuf, peaks: extractPeaks(metroBuf) };
+    const newMetro = generateMetronomeBuffer(
+      ctx,
+      safeBpm,
+      activeSong.duration || 32,
+      activeSong.firstBeatOffset || 0
+    );
     if (stemsDataRef.current) {
       stemsDataRef.current = {
         ...stemsDataRef.current,
-        metronome: newMetroStem
+        metronome: newMetro
       };
       inMemoryStemsCache.set(activeSong.id, stemsDataRef.current);
     }
+    setPeaksMap((prev) => ({
+      ...prev,
+      metronome: newMetro.peaks
+    }));
+    setSongs((prev) =>
+      prev.map((s) => (s.id === activeSong.id ? { ...s, bpm: safeBpm } : s))
+    );
+    if (isPlaying) {
+      startPlaybackAt(currentTime);
+    }
+    showToast(`BPM ajustado para ${safeBpm}`);
+  };
+
+  // Tap Tempo: toque 2 a 4 vezes no ritmo para calcular o BPM exato
+  const handleTapTempo = () => {
+    ensureAudioContext(true);
+    const now = performance.now();
+    const recent = tapTimesRef.current.filter((t) => now - t < 2500);
+    recent.push(now);
+    tapTimesRef.current = recent;
+    if (recent.length >= 2) {
+      const intervals = [];
+      for (let i = 1; i < recent.length; i++) {
+        intervals.push(recent[i] - recent[i - 1]);
+      }
+      const avgMs = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+      const tappedBpm = Math.round(60000 / avgMs);
+      if (tappedBpm >= 45 && tappedBpm <= 240) {
+        handleChangeSongBpm(tappedBpm);
+      }
+    }
+  };
+
+  // Ressincroniza a Batida 1 do Smart Metrônomo exatamente no segundo atual (caso queira cravar o clique na mão)
+  const handleSyncMetronomeHere = () => {
+    const ctx = ensureAudioContext(true);
+    const safeBpm = activeSong.bpm || 120;
+    const beatSec = 60 / safeBpm;
+    const newOffset = currentTime % beatSec;
+    const duration = activeSong.duration || 32;
+
+    const newMetro = generateMetronomeBuffer(ctx, safeBpm, duration, newOffset);
+    if (stemsDataRef.current) {
+      stemsDataRef.current = {
+        ...stemsDataRef.current,
+        metronome: newMetro
+      };
+      inMemoryStemsCache.set(activeSong.id, stemsDataRef.current);
+    }
+
+    setPeaksMap((prev) => ({
+      ...prev,
+      metronome: newMetro.peaks
+    }));
+
+    setSongs((prev) =>
+      prev.map((s) => (s.id === activeSong.id ? { ...s, firstBeatOffset: newOffset } : s))
+    );
 
     setTrackStates((prev) => ({
       ...prev,
@@ -662,7 +718,7 @@ export default function App() {
     if (isPlaying) {
       startPlaybackAt(currentTime);
     }
-    showToast('Metrônomo alinhado com o tempo atual!');
+    showToast('Tempo 1 do Metrônomo calibrado neste segundo!');
   };
 
   const handleToggleMute = (key) => {
@@ -776,6 +832,76 @@ export default function App() {
 
     try {
       const ctx = ensureAudioContext();
+
+      // Se o servidor neural Demucs v4 (Local ou Colab) estiver conectado, prioriza separação via IA
+      if (backendOnline) {
+        try {
+          setProcessingStep('2/4 • Enviando ao servidor de IA Demucs v4 (htdemucs)...');
+          const formData = new FormData();
+          formData.append('file', file);
+          const sepRes = await fetch(`${backendUrl}/api/separate`, {
+            method: 'POST',
+            body: formData
+          });
+          if (sepRes.ok) {
+            const sepData = await sepRes.json();
+            setProcessingStep('3/4 • Baixando stems isolados em alta fidelidade...');
+            const loadedStems = {};
+            for (const k of ['vocals', 'drums', 'bass', 'other']) {
+              const wavRes = await fetch(sepData.stemUrls[k]);
+              const arr = await wavRes.arrayBuffer();
+              const buf = await safeDecodeAudioData(ctx, arr);
+              loadedStems[k] = { buffer: buf, peaks: extractPeaks(buf) };
+            }
+            const songBpm = sepData.bpm || 120;
+            const songDur = sepData.duration || 32;
+            loadedStems.metronome = generateMetronomeBuffer(ctx, songBpm, songDur, 0);
+
+            const songId = targetSongId || `local-${Date.now()}`;
+            const neuralSong = {
+              id: songId,
+              title: file.name.replace(/\.[^/.]+$/, ''),
+              artist: 'Arquivo Local • Demucs v4 Neural',
+              bpm: songBpm,
+              originalKey: sepData.originalKey || 'Am',
+              duration: songDur,
+              thumbnail: null,
+              coverGradient: 'from-emerald-600 via-teal-800 to-slate-900',
+              customStems: loadedStems,
+              chords:
+                sepData.chords && sepData.chords.length > 0
+                  ? sepData.chords
+                  : [{ time: 0, duration: songDur, chord: sepData.originalKey || 'Am' }],
+              sections: [
+                { name: 'Parte A', start: 0, end: Math.round(songDur * 0.5) },
+                { name: 'Parte B', start: Math.round(songDur * 0.5), end: Math.round(songDur) }
+              ],
+              peaks: {
+                vocals: loadedStems.vocals.peaks,
+                drums: loadedStems.drums.peaks,
+                bass: loadedStems.bass.peaks,
+                other: loadedStems.other.peaks,
+                metronome: loadedStems.metronome.peaks
+              }
+            };
+
+            setSongs((prev) => [neuralSong, ...prev.filter((s) => s.id !== songId)]);
+            await saveTrackToDB(neuralSong);
+            stemsDataRef.current = neuralSong.customStems;
+            synthesizedSongIdRef.current = neuralSong.id;
+            prevSongIdRef.current = neuralSong.id;
+            setPeaksMap(neuralSong.peaks);
+            setActiveSongId(neuralSong.id);
+            setShowImportModal(false);
+            setCurrentPage('studio');
+            setMobileTab('mixer');
+            showToast(`"${neuralSong.title}" (${neuralSong.originalKey} • Demucs v4) pronta!`);
+            return;
+          }
+        } catch (backendErr) {
+          console.warn('Servidor Demucs não respondeu, usando processamento DSP do navegador:', backendErr);
+        }
+      }
 
       setProcessingStep('2/4 • Decodificando áudio no navegador...');
       await new Promise((r) => setTimeout(r, 40));
@@ -1232,6 +1358,16 @@ export default function App() {
   if (currentPage === 'catalog') {
     return (
       <>
+        {/* Desbloqueio de áudio para iPhone / iOS Safari (toca no alto-falante mesmo com chave silenciosa) */}
+        <audio
+          ref={iosAudioUnlockerRef}
+          playsInline
+          preload="auto"
+          loop
+          src="data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA"
+          className="hidden"
+        />
+
         {toastMessage && (
           <div className="fixed top-16 right-4 z-50 flex items-center gap-2 bg-slate-900/95 border border-emerald-500/50 text-slate-100 px-3.5 py-2.5 rounded-xl shadow-2xl animate-bounce">
             <Check className="w-4 h-4 text-emerald-400 shrink-0" />
@@ -1304,6 +1440,16 @@ export default function App() {
   // Se o usuário estiver na tela de Estúdio / Mixer Multitrack
   return (
     <div className="h-[100dvh] max-h-[100dvh] overflow-hidden bg-[#090D0B] text-slate-100 flex flex-col font-sans selection:bg-emerald-500/30">
+      {/* Desbloqueio de áudio para iPhone / iOS Safari (toca no alto-falante mesmo com chave silenciosa) */}
+      <audio
+        ref={iosAudioUnlockerRef}
+        playsInline
+        preload="auto"
+        loop
+        src="data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA"
+        className="hidden"
+      />
+
       {/* Input invisível para substituição rápida de áudio real */}
       <input
         ref={replaceAudioInputRef}
@@ -1348,6 +1494,10 @@ export default function App() {
         playbackSpeed={playbackSpeed}
         setPlaybackSpeed={handleChangePlaybackSpeed}
         currentBpm={currentBpm}
+        baseBpm={activeSong.bpm}
+        onChangeBpm={handleChangeSongBpm}
+        onTapTempo={handleTapTempo}
+        onSyncMetronome={handleSyncMetronomeHere}
         countInBars={countInBars}
         setCountInBars={setCountInBars}
         setShowImportModal={setShowImportModal}
@@ -1421,8 +1571,14 @@ export default function App() {
             pitchSemitones={pitchSemitones}
             setPitchSemitones={handleChangePitch}
             currentBpm={currentBpm}
+            baseBpm={activeSong.bpm}
+            onChangeBpm={handleChangeSongBpm}
+            onTapTempo={handleTapTempo}
+            onSyncMetronome={handleSyncMetronomeHere}
             playbackSpeed={playbackSpeed}
             setPlaybackSpeed={handleChangePlaybackSpeed}
+            trackStates={trackStates}
+            handleToggleMute={handleToggleMute}
           />
         )}
 

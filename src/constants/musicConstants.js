@@ -323,6 +323,36 @@ def process_youtube(url: str = Form(...)):
         }
     }
 
+@app.post("/api/separate")
+async def separate_audio_file(file: UploadFile = File(...)):
+    job_id = str(uuid.uuid4())[:8]
+    job_dir = WORKSPACE / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    input_file = job_dir / file.filename
+    with open(input_file, "wb") as f_out:
+        f_out.write(await file.read())
+    
+    subprocess.run([
+        "demucs", "-n", "htdemucs", "-o", str(job_dir), str(input_file)
+    ], check=True)
+    
+    analysis = analyze_harmony_and_beats(str(input_file))
+    stem_sub = input_file.stem
+    base_url = f"http://localhost:8000/stems/{job_id}/htdemucs/{stem_sub}"
+    
+    return {
+        "id": job_id,
+        "title": file.filename,
+        "artist": "Demucs v4 Neural",
+        **analysis,
+        "stemUrls": {
+            "vocals": f"{base_url}/vocals.wav",
+            "drums": f"{base_url}/drums.wav",
+            "bass": f"{base_url}/bass.wav",
+            "other": f"{base_url}/other.wav"
+        }
+    }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
@@ -398,6 +428,32 @@ def process_yt(url: str = Form(...)):
         "id": jid,
         "title": "YouTube (" + jid + ")",
         "artist": "Demucs v4 (GPU Colab)",
+        **an,
+        "stemUrls": {
+            "vocals": base + "/vocals.wav",
+            "drums": base + "/drums.wav",
+            "bass": base + "/bass.wav",
+            "other": base + "/other.wav"
+        }
+    }
+
+@app.post("/api/separate")
+async def process_file(file: UploadFile = File(...)):
+    jid = str(uuid.uuid4())[:8]
+    jdir = WORKSPACE / jid
+    jdir.mkdir(parents=True, exist_ok=True)
+    in_file = jdir / file.filename
+    with open(in_file, "wb") as f_out:
+        f_out.write(await file.read())
+    subprocess.run(["demucs", "-d", "cuda", "-n", "htdemucs", "-o", str(jdir), str(in_file)], check=True)
+    an = analyze_audio(str(in_file))
+    host = os.environ.get("DAVI_PUBLIC_HOST", "http://localhost:8000")
+    stem_sub = in_file.stem
+    base = host + "/stems/" + jid + "/htdemucs/" + stem_sub
+    return {
+        "id": jid,
+        "title": file.filename,
+        "artist": "Demucs v4 Neural (GPU Colab)",
         **an,
         "stemUrls": {
             "vocals": base + "/vocals.wav",
