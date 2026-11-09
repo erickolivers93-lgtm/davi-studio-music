@@ -33,6 +33,8 @@ export const ImportModal = ({
   const [activeImportTab, setActiveImportTab] = useState('youtube'); // 'youtube' | 'url' | 'file' | 'demo'
   const [directAudioUrl, setDirectAudioUrl] = useState('');
   const [ytPreview, setYtPreview] = useState(null);
+  const [isFileDragging, setIsFileDragging] = useState(false);
+  const [isYtDragging, setIsYtDragging] = useState(false);
 
   // Detecta se a URL do YouTube é válida para mostrar thumbnail e atalhos
   useEffect(() => {
@@ -238,14 +240,32 @@ export const ImportModal = ({
                           </div>
 
                           {/* Dropzone para vincular o MP3 diretamente à música do YouTube */}
-                          <label className="flex items-center justify-center gap-2 p-3 rounded-xl border border-dashed border-emerald-500/50 hover:border-emerald-400 bg-emerald-950/20 cursor-pointer text-center group transition-colors">
-                            <FileAudio className="w-4 h-4 text-emerald-400 group-hover:scale-110 transition-transform" />
+                          <label
+                            onDragOver={(e) => {
+                              e.preventDefault();
+                              setIsYtDragging(true);
+                            }}
+                            onDragLeave={() => setIsYtDragging(false)}
+                            onDrop={(e) => {
+                              e.preventDefault();
+                              setIsYtDragging(false);
+                              if (e.dataTransfer?.files?.length > 0) {
+                                handleYoutubeDirectMp3Upload({ dataTransfer: e.dataTransfer }, ytPreview);
+                              }
+                            }}
+                            className={`flex items-center justify-center gap-2 p-3.5 rounded-xl border-2 border-dashed cursor-pointer text-center group transition-all ${
+                              isYtDragging
+                                ? 'border-emerald-400 bg-emerald-500/20 scale-[1.02]'
+                                : 'border-emerald-500/50 hover:border-emerald-400 bg-emerald-950/20'
+                            }`}
+                          >
+                            <FileAudio className="w-4 h-4 text-emerald-400 group-hover:scale-110 transition-transform shrink-0" />
                             <span className="text-[11px] font-bold text-emerald-200">
-                              Solte o MP3 baixado aqui para vincular
+                              {isYtDragging ? 'Solte o arquivo MP3 aqui!' : 'Solte ou selecione o MP3 baixado'}
                             </span>
                             <input
                               type="file"
-                              accept="audio/*"
+                              accept="audio/*, .mp3, .wav, .m4a, .aac, .ogg, .flac, .webm, audio/mpeg, audio/mp3, audio/wav, audio/x-wav, audio/x-m4a, audio/mp4"
                               onChange={(e) => handleYoutubeDirectMp3Upload(e, ytPreview)}
                               className="hidden"
                             />
@@ -318,22 +338,40 @@ export const ImportModal = ({
             {/* Aba 3: Arquivo do Aparelho */}
             {activeImportTab === 'file' && (
               <div className="space-y-3">
-                <label className="flex flex-col items-center justify-center border-2 border-dashed border-emerald-800/80 hover:border-emerald-400 rounded-xl p-6 cursor-pointer bg-[#0D1310] transition-colors text-center group">
+                <label
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setIsFileDragging(true);
+                  }}
+                  onDragLeave={() => setIsFileDragging(false)}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    setIsFileDragging(false);
+                    if (e.dataTransfer?.files?.length > 0) {
+                      handleLocalFileUpload({ dataTransfer: e.dataTransfer });
+                    }
+                  }}
+                  className={`flex flex-col items-center justify-center border-2 border-dashed rounded-xl p-6 cursor-pointer bg-[#0D1310] transition-all text-center group ${
+                    isFileDragging
+                      ? 'border-emerald-400 bg-emerald-500/10 scale-[1.02]'
+                      : 'border-emerald-800/80 hover:border-emerald-400'
+                  }`}
+                >
                   <div className="w-12 h-12 rounded-full bg-emerald-500/10 text-emerald-400 flex items-center justify-center mb-2 group-hover:scale-110 transition-transform">
                     <Upload className="w-6 h-6" />
                   </div>
                   <span className="text-xs sm:text-sm font-bold text-slate-200">
-                    Toque para selecionar áudio do aparelho
+                    {isFileDragging ? 'Solte o arquivo de áudio aqui!' : 'Toque ou arraste seu arquivo de áudio'}
                   </span>
                   <span className="text-[11px] text-slate-400 mt-1">
-                    Formatos suportados: .MP3, .WAV, .M4A, .AAC, .OGG
+                    Formatos aceitos: .MP3, .WAV, .M4A, .AAC, .OGG, .FLAC
                   </span>
                   <span className="text-[10px] text-emerald-400 font-semibold mt-2 px-2 py-0.5 rounded bg-emerald-500/15">
-                    ⚡ 100% Separação DSP Client-side (Custo Zero)
+                    ⚡ Separação DSP 4 Faixas + Reconhecimento Real de Tom
                   </span>
                   <input
                     type="file"
-                    accept="audio/*"
+                    accept="audio/*, .mp3, .wav, .m4a, .aac, .ogg, .flac, .webm, audio/mpeg, audio/mp3, audio/wav, audio/x-wav, audio/x-m4a, audio/mp4"
                     onChange={handleLocalFileUpload}
                     className="hidden"
                   />

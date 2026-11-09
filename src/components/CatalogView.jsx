@@ -27,12 +27,16 @@ export const CatalogView = ({
   backendOnline,
   processingJob,
   onDeleteSong,
-  onResetCatalog
+  onResetCatalog,
+  previewingId = null,
+  onTogglePreview = null
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedFilter, setSelectedFilter] = useState('all'); // 'all' | 'presets' | 'imported'
-  const [previewingId, setPreviewingId] = useState(null);
+  const [internalPreviewingId, setInternalPreviewingId] = useState(null);
   const [songToDelete, setSongToDelete] = useState(null);
+
+  const activePreviewId = previewingId !== null ? previewingId : internalPreviewingId;
 
   const filteredSongs = songs.filter((song) => {
     const matchesSearch =
@@ -46,8 +50,12 @@ export const CatalogView = ({
     return true;
   });
 
-  const togglePreview = (id) => {
-    setPreviewingId((prev) => (prev === id ? null : id));
+  const togglePreview = (song) => {
+    if (onTogglePreview) {
+      onTogglePreview(song);
+    } else {
+      setInternalPreviewingId((prev) => (prev === song.id ? null : song.id));
+    }
   };
 
   const confirmDelete = () => {
@@ -302,14 +310,22 @@ export const CatalogView = ({
                       )}
                       <button
                         type="button"
-                        onClick={() => togglePreview(song.id)}
-                        className="absolute inset-0 bg-black/40 backdrop-blur-[2px] opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity"
-                        title="Prévia Rápida"
+                        onClick={() => togglePreview(song)}
+                        className={`absolute inset-0 bg-black/40 backdrop-blur-[2px] flex items-center justify-center transition-all ${
+                          activePreviewId === song.id
+                            ? 'opacity-100 bg-emerald-950/60'
+                            : 'opacity-80 sm:opacity-0 sm:group-hover:opacity-100'
+                        }`}
+                        title={activePreviewId === song.id ? 'Pausar Prévia' : 'Tocar Prévia'}
                       >
-                        {previewingId === song.id ? (
-                          <Pause className="w-6 h-6 text-emerald-400" />
+                        {activePreviewId === song.id ? (
+                          <div className="w-8 h-8 rounded-full bg-emerald-500 text-slate-950 flex items-center justify-center shadow-lg shadow-emerald-500/30 animate-pulse">
+                            <Pause className="w-4 h-4 fill-current" />
+                          </div>
                         ) : (
-                          <Play className="w-6 h-6 text-white ml-0.5" />
+                          <div className="w-8 h-8 rounded-full bg-white/20 hover:bg-emerald-500 text-white hover:text-slate-950 flex items-center justify-center transition-colors">
+                            <Play className="w-4 h-4 ml-0.5 fill-current" />
+                          </div>
                         )}
                       </button>
                     </div>

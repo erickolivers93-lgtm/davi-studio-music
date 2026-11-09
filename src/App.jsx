@@ -14,12 +14,18 @@ import {
   extractPeaks
 } from './audio/audioEngine';
 import { separateLocalAudioBufferClientSide } from './audio/dspSeparator';
-import { fetchAndDecodeAudio, processAudioBufferIntoSong } from './audio/audioProcessor';
+import {
+  safeDecodeAudioData,
+  fetchAndDecodeAudio,
+  processAudioBufferIntoSong,
+  ensureSongStemsLoaded
+} from './audio/audioProcessor';
 import { exportMixToWavBlob } from './audio/wavExporter';
 import {
   saveTrackToDB,
   getAllTracksFromDB,
-  deleteTrackFromDB
+  deleteTrackFromDB,
+  inMemoryStemsCache
 } from './audio/audioStorage';
 
 import { CatalogView } from './components/CatalogView';
@@ -254,15 +260,25 @@ export default function App() {
         } catch (_) {}
       }
 
-      // Se a música for de catálogo e o tom mudou, sintetiza no tom exato (Zero ruído metálico)
+      const isCustomSong = Boolean(
+        activeSong.customStems ||
+        activeSong.audioBlob ||
+        inMemoryStemsCache.has(activeSong.id) ||
+        activeSong.id.startsWith('local-') ||
+        activeSong.id.startsWith('yt-')
+      );
+
       const needsRegen =
         !stemsDataRef.current?.vocals ||
         synthesizedSongIdRef.current !== activeSong.id ||
-        (!activeSong.customStems && synthesizedPitchRef.current !== pitchSemitones);
+        (!isCustomSong && synthesizedPitchRef.current !== pitchSemitones);
 
       if (needsRegen) {
-        if (activeSong.customStems) {
-          stemsDataRef.current = activeSong.customStems;
+        if (isCustomSong) {
+          const loadedStems = await ensureSongStemsLoaded(ctx, activeSong);
+          if (loadedStems) {
+            stemsDataRef.current = loadedStems;
+          }
         } else {
           stemsDataRef.current = synthesizeSongStems(ctx, activeSong, pitchSemitones);
         }
@@ -270,10 +286,14 @@ export default function App() {
         synthesizedPitchRef.current = pitchSemitones;
 
         const realPeaks = {};
-        Object.keys(stemsDataRef.current).forEach((k) => {
-          realPeaks[k] = stemsDataRef.current[k].peaks;
-        });
-        setPeaksMap(realPeaks);
+        if (stemsDataRef.current) {
+          Object.keys(stemsDataRef.current).forEach((k) => {
+            if (stemsDataRef.current[k]?.peaks) {
+              realPeaks[k] = stemsDataRef.current[k].peaks;
+            }
+          });
+          setPeaksMap(realPeaks);
+        }
       }
 
       stopAudioNodes();
@@ -286,15 +306,15 @@ export default function App() {
       const syncStartTime = ctx.currentTime + 0.015;
 
       Object.keys(trackStates).forEach((key) => {
-        const stemObj = stemsDataRef.current[key];
+        const stemObj = stemsDataRef.current?.[key];
         if (!stemObj?.buffer) return;
 
         const source = ctx.createBufferSource();
         source.buffer = stemObj.buffer;
         source.playbackRate.value = playbackSpeed;
 
-        // Para faixas customizadas de upload, aplica detune nativo limpo do Web Audio nos harmônicos
-        if (activeSong.customStems && (key === 'vocals' || key === 'bass' || key === 'other')) {
+        // Para faixas com áudio real, aplica detune nativo limpo do Web Audio
+        if (isCustomSong && (key === 'vocals' || key === 'bass' || key === 'other')) {
           if (source.detune) {
             source.detune.value = pitchSemitones * 100;
           }
@@ -481,80 +501,72 @@ export default function App() {
     showToast('Mixagem exportada em .WAV');
   };
 
-  // Upload Local com Separação DSP Client-side Real (Salva no IndexedDB)
+  // Upload Local com Separação DSP Client-side Real e Detecção de Tonalidade (Salva no IndexedDB)
   const handleLocalFileUpload = async (e, targetSongId = null) => {
-    const file = e.target.files?.[0];
+    let file = null;
+    if (e.target?.files?.length > 0) {
+      file = e.target.files[0];
+    } else if (e.dataTransfer?.files?.length > 0) {
+      file = e.dataTransfer.files[0];
+    }
+    if (e.target) e.target.value = '';
     if (!file) return;
+
     setIsProcessingImport(true);
-    setProcessingStep('Decodificando arquivo e executando separação DSP Mid-Side no áudio real...');
+    setProcessingStep('Lendo arquivo de áudio e inicializando decodificador...');
 
     try {
       const ctx = ensureAudioContext();
-      const arrayBuf = await file.arrayBuffer();
-      const decoded = await ctx.decodeAudioData(arrayBuf);
-      const { detectedBpm, stems: customStems } = await separateLocalAudioBufferClientSide(
-        ctx,
-        decoded
-      );
-
-      const barDur = (60 / detectedBpm) * 4;
-      const generatedChords = [];
-      const defaultProgression = ['Am', 'F', 'C', 'G', 'Dm', 'Em', 'F', 'G'];
-      for (let idx = 0; idx * barDur < decoded.duration; idx++) {
-        generatedChords.push({
-          time: Number((idx * barDur).toFixed(2)),
-          duration: Number(barDur.toFixed(2)),
-          chord: defaultProgression[idx % defaultProgression.length]
-        });
+      if (ctx.state === 'suspended') {
+        await ctx.resume().catch(() => {});
       }
 
-      // Se for substituição de uma música existente (ex: YouTube -> MP3 Real)
+      setProcessingStep('Decodificando áudio no navegador...');
+      const arrayBuf = await file.arrayBuffer();
+      const rawBlob = new Blob([arrayBuf], { type: file.type || 'audio/mpeg' });
+      const decoded = await safeDecodeAudioData(ctx, arrayBuf);
+
+      setProcessingStep('Separando 4 stems DSP e detectando tonalidade real...');
       const existing = targetSongId ? songs.find((s) => s.id === targetSongId) : null;
       const songId = targetSongId || `local-${Date.now()}`;
       const songTitle = existing ? existing.title : file.name.replace(/\.[^/.]+$/, '');
-      const songArtist = existing ? existing.artist : `Arquivo Local • ${detectedBpm} BPM`;
+      const songArtist = existing ? existing.artist : `Arquivo Local • ${(file.size / (1024 * 1024)).toFixed(1)} MB`;
 
-      const newSong = {
-        id: songId,
-        title: songTitle,
-        artist: songArtist,
-        bpm: detectedBpm,
-        originalKey: existing?.originalKey || 'Am',
-        duration: decoded.duration,
-        thumbnail: existing?.thumbnail,
-        coverGradient: existing?.coverGradient || 'from-cyan-600 via-teal-700 to-slate-900',
-        customStems,
-        sections: [
-          { name: 'Intro', start: 0, end: Math.round(decoded.duration * 0.25) },
-          {
-            name: 'Meio',
-            start: Math.round(decoded.duration * 0.25),
-            end: Math.round(decoded.duration * 0.65)
-          },
-          {
-            name: 'Final',
-            start: Math.round(decoded.duration * 0.65),
-            end: Math.round(decoded.duration)
-          }
-        ],
-        chords: generatedChords
-      };
+      const newSong = await processAudioBufferIntoSong(
+        ctx,
+        decoded,
+        {
+          id: songId,
+          title: songTitle,
+          artist: songArtist,
+          thumbnail: existing?.thumbnail || null,
+          coverGradient: existing?.coverGradient || 'from-cyan-600 via-teal-700 to-slate-900'
+        },
+        rawBlob
+      );
 
+      // Atualiza lista de músicas
       setSongs((prev) => {
         const withoutOld = prev.filter((s) => s.id !== songId);
         return [newSong, ...withoutOld];
       });
 
-      // Salva no IndexedDB
-      saveTrackToDB(newSong);
+      // Salva no IndexedDB com audioBlob
+      await saveTrackToDB(newSong);
+
+      // Armazena no cache de stems
+      stemsDataRef.current = newSong.customStems;
+      synthesizedSongIdRef.current = newSong.id;
+      setPeaksMap(newSong.peaks);
 
       setActiveSongId(newSong.id);
       setShowImportModal(false);
       setCurrentPage('studio');
       setMobileTab('mixer');
-      showToast(`Áudio real de "${songTitle}" separado em 4 faixas!`);
-    } catch (_) {
-      showToast('Erro ao decodificar arquivo de áudio');
+      showToast(`Áudio de "${newSong.title}" (Tom ${newSong.originalKey}) pronto no estúdio!`);
+    } catch (err) {
+      console.error('Erro no upload local:', err);
+      showToast(err.message || 'Erro ao decodificar arquivo de áudio');
     } finally {
       setIsProcessingImport(false);
       setProcessingStep('');
@@ -564,27 +576,43 @@ export default function App() {
   // Importação direta de áudio por URL (MP3/WAV da Web ou download do Y2Mate)
   const handleAudioUrlImport = async (audioUrl) => {
     setIsProcessingImport(true);
-    setProcessingStep('Baixando áudio da URL e processando separação DSP...');
+    setProcessingStep('Baixando áudio da URL...');
 
     try {
       const ctx = ensureAudioContext();
-      const decoded = await fetchAndDecodeAudio(ctx, audioUrl);
+      if (ctx.state === 'suspended') {
+        await ctx.resume().catch(() => {});
+      }
+
+      const { decoded, audioBlob } = await fetchAndDecodeAudio(ctx, audioUrl);
       const urlFileName = audioUrl.split('/').pop().split('?')[0] || 'Áudio Remoto';
       const cleanTitle = decodeURIComponent(urlFileName).replace(/\.[^/.]+$/, '');
 
-      const newSong = await processAudioBufferIntoSong(ctx, decoded, {
-        title: cleanTitle || 'Música Remota',
-        artist: 'Link da Web • Áudio Real'
-      });
+      setProcessingStep('Separando stems e detectando tom real...');
+      const newSong = await processAudioBufferIntoSong(
+        ctx,
+        decoded,
+        {
+          title: cleanTitle || 'Música Remota',
+          artist: 'Link da Web • Áudio Real'
+        },
+        audioBlob
+      );
 
       setSongs((prev) => [newSong, ...prev.filter((s) => s.id !== newSong.id)]);
-      saveTrackToDB(newSong);
+      await saveTrackToDB(newSong);
+
+      stemsDataRef.current = newSong.customStems;
+      synthesizedSongIdRef.current = newSong.id;
+      setPeaksMap(newSong.peaks);
+
       setActiveSongId(newSong.id);
       setShowImportModal(false);
       setCurrentPage('studio');
       setMobileTab('mixer');
-      showToast(`Áudio real de "${newSong.title}" baixado e separado!`);
+      showToast(`Áudio real de "${newSong.title}" (Tom ${newSong.originalKey}) pronto!`);
     } catch (err) {
+      console.error('Erro no download por URL:', err);
       showToast(err.message || 'Erro ao baixar arquivo de áudio da URL');
     } finally {
       setIsProcessingImport(false);
@@ -594,7 +622,13 @@ export default function App() {
 
   // Upload de arquivo MP3 do YouTube (vincula metadados do vídeo ao áudio real baixado)
   const handleYoutubeDirectMp3Upload = async (e, ytPreview) => {
-    const file = e.target.files?.[0];
+    let file = null;
+    if (e.target?.files?.length > 0) {
+      file = e.target.files[0];
+    } else if (e.dataTransfer?.files?.length > 0) {
+      file = e.dataTransfer.files[0];
+    }
+    if (e.target) e.target.value = '';
     if (!file) return;
 
     setIsProcessingImport(true);
@@ -602,29 +636,46 @@ export default function App() {
 
     try {
       const ctx = ensureAudioContext();
+      if (ctx.state === 'suspended') {
+        await ctx.resume().catch(() => {});
+      }
+
       const arrayBuf = await file.arrayBuffer();
-      const decoded = await ctx.decodeAudioData(arrayBuf);
+      const rawBlob = new Blob([arrayBuf], { type: file.type || 'audio/mpeg' });
+      const decoded = await safeDecodeAudioData(ctx, arrayBuf);
 
       const songId = `yt-${ytPreview?.id || Date.now()}`;
       const songTitle = file.name.replace(/\.[^/.]+$/, '');
 
-      const newSong = await processAudioBufferIntoSong(ctx, decoded, {
-        id: songId,
-        title: songTitle,
-        artist: 'YouTube • MP3 Real Vinculado',
-        thumbnail: ytPreview?.thumbnail || null,
-        coverGradient: 'from-rose-600 via-red-800 to-stone-900'
-      });
+      setProcessingStep('Separando faixas e detectando tom da música...');
+      const newSong = await processAudioBufferIntoSong(
+        ctx,
+        decoded,
+        {
+          id: songId,
+          title: songTitle,
+          artist: 'YouTube • MP3 Real Vinculado',
+          thumbnail: ytPreview?.thumbnail || null,
+          coverGradient: 'from-rose-600 via-red-800 to-stone-900'
+        },
+        rawBlob
+      );
 
       setSongs((prev) => [newSong, ...prev.filter((s) => s.id !== songId)]);
-      saveTrackToDB(newSong);
+      await saveTrackToDB(newSong);
+
+      stemsDataRef.current = newSong.customStems;
+      synthesizedSongIdRef.current = newSong.id;
+      setPeaksMap(newSong.peaks);
+
       setActiveSongId(newSong.id);
       setShowImportModal(false);
       setCurrentPage('studio');
       setMobileTab('mixer');
-      showToast(`Música "${newSong.title}" vinculada ao áudio real e separada!`);
-    } catch (_) {
-      showToast('Erro ao processar arquivo MP3');
+      showToast(`Música "${newSong.title}" (Tom ${newSong.originalKey}) pronta no estúdio!`);
+    } catch (err) {
+      console.error('Erro ao processar MP3:', err);
+      showToast(err.message || 'Erro ao processar arquivo MP3');
     } finally {
       setIsProcessingImport(false);
       setProcessingStep('');
@@ -820,6 +871,23 @@ export default function App() {
     showToast('Catálogo original restaurado!');
   };
 
+  const handleToggleCatalogPreview = async (song) => {
+    const ctx = ensureAudioContext();
+    if (ctx.state === 'suspended') {
+      await ctx.resume().catch(() => {});
+    }
+
+    if (isPlaying && activeSongId === song.id) {
+      stopAudioNodes();
+      setIsPlaying(false);
+      return;
+    }
+
+    stopAudioNodes();
+    setActiveSongId(song.id);
+    await startPlaybackAt(0);
+  };
+
   const currentKey = useMemo(
     () => transposeChord(activeSong.originalKey, pitchSemitones),
     [activeSong.originalKey, pitchSemitones]
@@ -880,6 +948,8 @@ export default function App() {
 
         <CatalogView
           songs={songs}
+          previewingId={isPlaying ? activeSongId : null}
+          onTogglePreview={handleToggleCatalogPreview}
           onOpenSongInStudio={(id) => {
             stopAudioNodes();
             setActiveSongId(id);
