@@ -327,3 +327,109 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
 `;
+
+export const COLAB_NOTEBOOK_CODE = `# DAVI Studio AI - Google Colab GPU Runner (Demucs v4 + yt-dlp)
+# 1. Ative GPU T4 em: Ambiente de Execução > Alterar tipo de ambiente de execução
+# 2. Rode esta célula. Copie o link '.trycloudflare.com' gerado e cole no app!
+
+import os, time, subprocess, re
+
+print("Instalando Demucs v4, yt-dlp e dependencias...")
+subprocess.run(["pip", "install", "-q", "fastapi", "uvicorn", "yt-dlp", "demucs", "librosa", "soundfile", "numpy", "python-multipart"], check=True)
+
+print("Configurando tunel Cloudflare seguro...")
+subprocess.run(["wget", "-q", "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb"], check=True)
+subprocess.run(["dpkg", "-i", "cloudflared-linux-amd64.deb"], check=True)
+
+server_code = """
+import os, uuid, subprocess
+from pathlib import Path
+from fastapi import FastAPI, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+import librosa, numpy as np
+
+app = FastAPI(title="DAVI Studio Colab AI")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+WORKSPACE = Path("/content/workspace_stems")
+WORKSPACE.mkdir(parents=True, exist_ok=True)
+app.mount("/stems", StaticFiles(directory=str(WORKSPACE)), name="stems")
+
+NOTES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+def analyze_audio(path):
+    y, sr = librosa.load(path, sr=22050, mono=True)
+    dur = float(librosa.get_duration(y=y, sr=sr))
+    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+    bpm = int(round(float(np.ndim(tempo) > 0 and tempo[0] or tempo)))
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+    key_idx = int(np.argmax(np.mean(chroma, axis=1)))
+    chords = []
+    step = 2.0
+    for i in range(int(np.ceil(dur / step))):
+        t0 = i * step
+        f0 = librosa.time_to_frames(t0, sr=sr)
+        f1 = librosa.time_to_frames(min(dur, t0 + step), sr=sr)
+        if f1 > f0:
+            seg = np.mean(chroma[:, f0:f1], axis=1)
+            r = int(np.argmax(seg))
+            qual = 'm' if m3 > M3 * 1.05 else ''
+            chord_name = str(NOTES[r]) + qual
+            chords.append({"time": round(t0, 2), "duration": step, "chord": chord_name})
+    return {"bpm": bpm, "originalKey": NOTES[key_idx], "duration": round(dur, 2), "chords": chords}
+
+@app.get("/api/health")
+def health():
+    return {"status": "online", "engine": "Google Colab GPU T4 (Demucs v4 + yt-dlp)"}
+
+@app.post("/api/youtube")
+def process_yt(url: str = Form(...)):
+    jid = str(uuid.uuid4())[:8]
+    jdir = WORKSPACE / jid
+    jdir.mkdir(parents=True, exist_ok=True)
+    in_mp3 = jdir / "original.mp3"
+    subprocess.run(["yt-dlp", "-x", "--audio-format", "mp3", "-o", str(in_mp3), url], check=True)
+    subprocess.run(["demucs", "-d", "cuda", "-n", "htdemucs", "-o", str(jdir), str(in_mp3)], check=True)
+    an = analyze_audio(str(in_mp3))
+    host = os.environ.get("DAVI_PUBLIC_HOST", "http://localhost:8000")
+    base = host + "/stems/" + jid + "/htdemucs/original"
+    return {
+        "id": jid,
+        "title": "YouTube (" + jid + ")",
+        "artist": "Demucs v4 (GPU Colab)",
+        **an,
+        "stemUrls": {
+            "vocals": base + "/vocals.wav",
+            "drums": base + "/drums.wav",
+            "bass": base + "/bass.wav",
+            "other": base + "/other.wav"
+        }
+    }
+"""
+
+with open("colab_app.py", "w") as f:
+    f.write(server_code)
+
+log = open("tunnel.log", "w")
+subprocess.Popen(["cloudflared", "tunnel", "--url", "http://localhost:8000"], stdout=log, stderr=log)
+time.sleep(3)
+url = None
+for _ in range(25):
+    if os.path.exists("tunnel.log"):
+        with open("tunnel.log") as f:
+            m = re.search(r"https://[a-zA-Z0-9-]+\\.trycloudflare\\.com", f.read())
+            if m:
+                url = m.group(0)
+                break
+    time.sleep(1)
+
+print("\\n" + "="*60)
+print("SERVIDOR DAVI STUDIO ONLINE: " + str(url))
+print("Cole a URL acima no DAVI Studio (icone de Servidor)")
+print("="*60 + "\\n")
+if url:
+    os.environ["DAVI_PUBLIC_HOST"] = url
+
+subprocess.run(["uvicorn", "colab_app:app", "--host", "0.0.0.0", "--port", "8000"])
+`;

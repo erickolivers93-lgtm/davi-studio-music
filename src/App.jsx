@@ -14,6 +14,7 @@ import {
   extractPeaks
 } from './audio/audioEngine';
 import { separateLocalAudioBufferClientSide } from './audio/dspSeparator';
+import { fetchAndDecodeAudio, processAudioBufferIntoSong } from './audio/audioProcessor';
 import { exportMixToWavBlob } from './audio/wavExporter';
 import {
   saveTrackToDB,
@@ -142,11 +143,20 @@ export default function App() {
     })();
   }, []);
 
-  const checkLocalBackend = useCallback(async () => {
+  const [backendUrl, setBackendUrl] = useState(() => {
+    try {
+      return localStorage.getItem('davi_studio_backend_url') || 'http://localhost:8000';
+    } catch (_) {
+      return 'http://localhost:8000';
+    }
+  });
+
+  const checkLocalBackend = useCallback(async (customUrl = null) => {
+    const url = (customUrl || backendUrl || 'http://localhost:8000').replace(/\/+$/, '');
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 1200);
-      const res = await fetch('http://localhost:8000/api/health', { signal: controller.signal });
+      const timeout = setTimeout(() => controller.abort(), 2000);
+      const res = await fetch(`${url}/api/health`, { signal: controller.signal });
       clearTimeout(timeout);
       if (res.ok) {
         setBackendOnline(true);
@@ -156,7 +166,7 @@ export default function App() {
       setBackendOnline(false);
     }
     return false;
-  }, []);
+  }, [backendUrl]);
 
   useEffect(() => {
     checkLocalBackend();
@@ -551,6 +561,76 @@ export default function App() {
     }
   };
 
+  // Importação direta de áudio por URL (MP3/WAV da Web ou download do Y2Mate)
+  const handleAudioUrlImport = async (audioUrl) => {
+    setIsProcessingImport(true);
+    setProcessingStep('Baixando áudio da URL e processando separação DSP...');
+
+    try {
+      const ctx = ensureAudioContext();
+      const decoded = await fetchAndDecodeAudio(ctx, audioUrl);
+      const urlFileName = audioUrl.split('/').pop().split('?')[0] || 'Áudio Remoto';
+      const cleanTitle = decodeURIComponent(urlFileName).replace(/\.[^/.]+$/, '');
+
+      const newSong = await processAudioBufferIntoSong(ctx, decoded, {
+        title: cleanTitle || 'Música Remota',
+        artist: 'Link da Web • Áudio Real'
+      });
+
+      setSongs((prev) => [newSong, ...prev.filter((s) => s.id !== newSong.id)]);
+      saveTrackToDB(newSong);
+      setActiveSongId(newSong.id);
+      setShowImportModal(false);
+      setCurrentPage('studio');
+      setMobileTab('mixer');
+      showToast(`Áudio real de "${newSong.title}" baixado e separado!`);
+    } catch (err) {
+      showToast(err.message || 'Erro ao baixar arquivo de áudio da URL');
+    } finally {
+      setIsProcessingImport(false);
+      setProcessingStep('');
+    }
+  };
+
+  // Upload de arquivo MP3 do YouTube (vincula metadados do vídeo ao áudio real baixado)
+  const handleYoutubeDirectMp3Upload = async (e, ytPreview) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsProcessingImport(true);
+    setProcessingStep('Decodificando MP3 e vinculando ao vídeo do YouTube...');
+
+    try {
+      const ctx = ensureAudioContext();
+      const arrayBuf = await file.arrayBuffer();
+      const decoded = await ctx.decodeAudioData(arrayBuf);
+
+      const songId = `yt-${ytPreview?.id || Date.now()}`;
+      const songTitle = file.name.replace(/\.[^/.]+$/, '');
+
+      const newSong = await processAudioBufferIntoSong(ctx, decoded, {
+        id: songId,
+        title: songTitle,
+        artist: 'YouTube • MP3 Real Vinculado',
+        thumbnail: ytPreview?.thumbnail || null,
+        coverGradient: 'from-rose-600 via-red-800 to-stone-900'
+      });
+
+      setSongs((prev) => [newSong, ...prev.filter((s) => s.id !== songId)]);
+      saveTrackToDB(newSong);
+      setActiveSongId(newSong.id);
+      setShowImportModal(false);
+      setCurrentPage('studio');
+      setMobileTab('mixer');
+      showToast(`Música "${newSong.title}" vinculada ao áudio real e separada!`);
+    } catch (_) {
+      showToast('Erro ao processar arquivo MP3');
+    } finally {
+      setIsProcessingImport(false);
+      setProcessingStep('');
+    }
+  };
+
   // Importação do YouTube Resiliente
   const handleYoutubeImport = async (e) => {
     e.preventDefault();
@@ -588,7 +668,7 @@ export default function App() {
     setProcessingJob(tempJob);
     setShowImportModal(false);
 
-    // Se o backend Python local estiver rodando (Demucs v4 real)
+    // Se o backend Python local ou túnel Colab estiver rodando (Demucs v4 real)
     const isServerUp = await checkLocalBackend();
     if (isServerUp) {
       try {
@@ -600,7 +680,7 @@ export default function App() {
 
         const formData = new FormData();
         formData.append('url', youtubeUrl);
-        const res = await fetch('http://localhost:8000/api/youtube', {
+        const res = await fetch(`${backendUrl}/api/youtube`, {
           method: 'POST',
           body: formData
         });
@@ -1043,16 +1123,21 @@ export default function App() {
         setYoutubeUrl={setYoutubeUrl}
         handleYoutubeImport={handleYoutubeImport}
         handleLocalFileUpload={handleLocalFileUpload}
+        handleAudioUrlImport={handleAudioUrlImport}
+        handleYoutubeDirectMp3Upload={handleYoutubeDirectMp3Upload}
         handleLoadDemoTrack={handleLoadDemoTrack}
         backendOnline={backendOnline}
+        onOpenBackendModal={() => setShowBackendModal(true)}
       />
 
-      {/* Modal 2: Servidor Python Local */}
+      {/* Modal 2: Servidor Python Local & Google Colab */}
       <BackendModal
         showBackendModal={showBackendModal}
         setShowBackendModal={setShowBackendModal}
         backendOnline={backendOnline}
         checkLocalBackend={checkLocalBackend}
+        backendUrl={backendUrl}
+        setBackendUrl={setBackendUrl}
       />
     </div>
   );
