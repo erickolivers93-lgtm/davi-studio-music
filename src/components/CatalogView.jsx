@@ -14,7 +14,9 @@ import {
   Trash2,
   CheckCircle2,
   RefreshCw,
-  Server
+  Server,
+  AlertTriangle,
+  RotateCcw
 } from 'lucide-react';
 
 export const CatalogView = ({
@@ -25,11 +27,12 @@ export const CatalogView = ({
   backendOnline,
   processingJob,
   onDeleteSong,
-  onLoadDemoTrack
+  onResetCatalog
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedFilter, setSelectedFilter] = useState('all'); // 'all' | 'presets' | 'imported'
   const [previewingId, setPreviewingId] = useState(null);
+  const [songToDelete, setSongToDelete] = useState(null);
 
   const filteredSongs = songs.filter((song) => {
     const matchesSearch =
@@ -47,10 +50,56 @@ export const CatalogView = ({
     setPreviewingId((prev) => (prev === id ? null : id));
   };
 
+  const confirmDelete = () => {
+    if (songToDelete && onDeleteSong) {
+      onDeleteSong(songToDelete.id);
+      setSongToDelete(null);
+    }
+  };
+
   return (
-    <div className="min-h-screen bg-[#090D0B] text-slate-100 flex flex-col font-sans">
+    <div className="h-screen w-full bg-[#090D0B] text-slate-100 flex flex-col font-sans overflow-y-auto overscroll-contain">
+      {/* Modal de Confirmação de Exclusão */}
+      {songToDelete && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-[#141C17] border border-rose-900/60 rounded-2xl max-w-sm w-full p-5 space-y-4 shadow-2xl">
+            <div className="flex items-center gap-3 text-rose-400">
+              <div className="w-10 h-10 rounded-xl bg-rose-500/20 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-5 h-5 text-rose-400" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-white">Excluir Música?</h3>
+                <p className="text-[11px] text-slate-400">Esta ação não pode ser desfeita.</p>
+              </div>
+            </div>
+
+            <p className="text-xs text-slate-300">
+              Tem certeza que deseja remover <strong className="text-white">"{songToDelete.title}"</strong> da sua biblioteca?
+            </p>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => setSongToDelete(null)}
+                className="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 transition-colors"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={confirmDelete}
+                className="px-3.5 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-xs font-bold text-white flex items-center gap-1.5 shadow-lg shadow-rose-600/30 transition-all"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Sim, Excluir</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Top Header do Catálogo */}
-      <header className="sticky top-0 z-30 bg-[#0E1612]/95 backdrop-blur-md border-b border-emerald-950/90 px-4 sm:px-8 py-3.5 flex items-center justify-between gap-3 shadow-xl">
+      <header className="sticky top-0 z-30 bg-[#0E1612]/95 backdrop-blur-md border-b border-emerald-950/90 px-4 sm:px-8 py-3.5 flex items-center justify-between gap-3 shadow-xl shrink-0">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-400 to-green-600 flex items-center justify-center shadow-lg shadow-emerald-500/25 border border-emerald-300/30">
             <Sliders className="w-5 h-5 text-slate-950 stroke-[2.5]" />
@@ -97,8 +146,8 @@ export const CatalogView = ({
         </div>
       </header>
 
-      {/* Conteúdo Principal do Catálogo */}
-      <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-8 py-6 space-y-6">
+      {/* Conteúdo Principal do Catálogo com Rolagem Total */}
+      <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-8 py-6 space-y-6 pb-20">
         {/* Banner de Boas-Vindas & Busca */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-gradient-to-r from-[#121C16] via-[#101914] to-[#0E1511] p-5 rounded-2xl border border-emerald-900/40 shadow-inner">
           <div className="space-y-1">
@@ -123,41 +172,55 @@ export const CatalogView = ({
           </div>
         </div>
 
-        {/* Filtros em Abas */}
-        <div className="flex items-center gap-2 border-b border-slate-800/80 pb-2 overflow-x-auto no-scrollbar">
-          <button
-            type="button"
-            onClick={() => setSelectedFilter('all')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
-              selectedFilter === 'all'
-                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/50'
-                : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            Todas ({songs.length})
-          </button>
-          <button
-            type="button"
-            onClick={() => setSelectedFilter('presets')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
-              selectedFilter === 'presets'
-                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/50'
-                : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            Demonstrações Studio
-          </button>
-          <button
-            type="button"
-            onClick={() => setSelectedFilter('imported')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
-              selectedFilter === 'imported'
-                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/50'
-                : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            Importadas / Uploads
-          </button>
+        {/* Filtros em Abas + Botão Restaurar */}
+        <div className="flex items-center justify-between gap-2 border-b border-slate-800/80 pb-2 flex-wrap">
+          <div className="flex items-center gap-2 overflow-x-auto no-scrollbar">
+            <button
+              type="button"
+              onClick={() => setSelectedFilter('all')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                selectedFilter === 'all'
+                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/50'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              Todas ({songs.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setSelectedFilter('presets')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                selectedFilter === 'presets'
+                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/50'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              Demonstrações Studio
+            </button>
+            <button
+              type="button"
+              onClick={() => setSelectedFilter('imported')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                selectedFilter === 'imported'
+                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/50'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              Importadas / Uploads
+            </button>
+          </div>
+
+          {onResetCatalog && (
+            <button
+              type="button"
+              onClick={onResetCatalog}
+              className="text-[11px] text-slate-500 hover:text-slate-300 flex items-center gap-1 transition-colors px-2 py-1 rounded"
+              title="Restaurar faixas padrão do catálogo"
+            >
+              <RotateCcw className="w-3 h-3" />
+              <span>Restaurar Catálogo</span>
+            </button>
+          )}
         </div>
 
         {/* Card de Processamento Ativo (se houver importação em andamento) */}
@@ -206,13 +269,12 @@ export const CatalogView = ({
               Faixas Prontas para Tocar ({filteredSongs.length})
             </span>
             <span className="text-xs text-slate-500">
-              Clique em qualquer música para entrar no Estúdio Multitrack
+              Role a página para ver todas as músicas
             </span>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
             {filteredSongs.map((song) => {
-              const isLocalOrYt = song.id.startsWith('local-') || song.id.startsWith('yt-');
               const minutes = Math.floor(song.duration / 60);
               const seconds = Math.floor(song.duration % 60);
               const durationFormatted = `${minutes}:${String(seconds).padStart(2, '0')}`;
@@ -293,23 +355,26 @@ export const CatalogView = ({
                     </div>
                   </div>
 
-                  {/* Ação Principal: Abrir no Estúdio */}
+                  {/* Ação Principal: Abrir no Estúdio + Botão Deletar */}
                   <div className="flex items-center justify-between pt-2 border-t border-slate-800/60 mt-1">
                     <span className="text-[11px] text-slate-400">
                       Mixador, Cifras & Pitch Shifter
                     </span>
 
                     <div className="flex items-center gap-2">
-                      {isLocalOrYt && (
-                        <button
-                          type="button"
-                          onClick={() => onDeleteSong && onDeleteSong(song.id)}
-                          className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
-                          title="Remover música da biblioteca"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      )}
+                      {/* Botão Deletar Visível em Todos os Cards */}
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSongToDelete(song);
+                        }}
+                        className="p-1.5 sm:px-2 sm:py-1.5 rounded-xl bg-slate-800/60 hover:bg-rose-500/20 text-slate-400 hover:text-rose-400 border border-slate-700/60 hover:border-rose-500/40 text-xs font-semibold flex items-center gap-1 transition-colors"
+                        title="Excluir música da biblioteca"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span className="hidden sm:inline">Excluir</span>
+                      </button>
 
                       <button
                         type="button"
@@ -355,7 +420,7 @@ export const CatalogView = ({
                   Enviar Arquivo MP3 / WAV / M4A
                 </h4>
                 <p className="text-[11px] text-slate-400 mt-0.5">
-                  Separação client-side via DSP Mid-Side sem gastar servidor.
+                  Separação client-side via DSP Mid-Side com o áudio REAL do seu arquivo.
                 </p>
               </div>
             </button>

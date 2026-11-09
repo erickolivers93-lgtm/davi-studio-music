@@ -51,15 +51,25 @@ export function generatePreviewPeaksForSong(song) {
   };
 }
 
+function getSongSeed(songId = '') {
+  let h = 0;
+  for (let i = 0; i < songId.length; i++) {
+    h = ((h << 5) - h) + songId.charCodeAt(i);
+    h |= 0;
+  }
+  return Math.abs(h);
+}
+
 export function synthesizeSongStems(ctx, song, pitchSemitones = 0) {
   const sampleRate = ctx.sampleRate || 44100;
-  const duration = song.duration;
+  const duration = song.duration || 32;
   const totalSamples = Math.floor(sampleRate * duration);
-  const beatDur = 60 / song.bpm;
+  const beatDur = 60 / (song.bpm || 120);
   const barDur = beatDur * 4;
 
   // Multiplicador exato de frequência para o tom selecionado: f = f0 * 2^(semitones / 12)
   const pitchRatio = Math.pow(2, pitchSemitones / 12);
+  const songSeed = getSongSeed(song.id);
 
   const createBuf = () => ctx.createBuffer(2, totalSamples, sampleRate);
   const vocalsBuf = createBuf();
@@ -75,13 +85,26 @@ export function synthesizeSongStems(ctx, song, pitchSemitones = 0) {
   const mL = metroBuf.getChannelData(0),  mR = metroBuf.getChannelData(1);
 
   const getChordAtTime = (t) => {
+    if (!song.chords || song.chords.length === 0) {
+      return { freqs: [220, 261.63, 329.63, 392] };
+    }
     const idx = Math.min(song.chords.length - 1, Math.floor(t / barDur));
     return song.chords[idx] || song.chords[0];
   };
 
+  // Padrões melódicos diferentes para cada faixa importada
+  const MELODY_PATTERNS = [
+    [0, 2, 1, 3, 2, 1, 0, -1],
+    [2, 3, 1, 0, 2, 1, 3, -1],
+    [0, 1, 2, 3, 1, 0, 2, -1],
+    [3, 1, 2, 0, 1, 2, 3, -1],
+    [1, 0, 3, 2, 0, 1, 2, -1],
+    [0, 2, 3, 2, 1, 0, 1, -1]
+  ];
+  const melodyPattern = MELODY_PATTERNS[songSeed % MELODY_PATTERNS.length];
+
   // 1. SÍNTESE DE VOCAL / MELODIA LEAD NO TOM EXATO
   let vocalPhase = 0;
-  const melodyPattern = [0, 2, 1, 3, 2, 1, 0, -1];
   const noteStep = beatDur * 0.5;
   for (let i = 0; i < totalSamples; i++) {
     const t = i / sampleRate;
@@ -106,7 +129,7 @@ export function synthesizeSongStems(ctx, song, pitchSemitones = 0) {
     }
   }
 
-  // 2. SÍNTESE DE BATERIA (Bumbo, Caixa, Chimbal) + SMART METRÔNOMO (Mantém punch rítmico nativo)
+  // 2. SÍNTESE DE BATERIA (Bumbo, Caixa, Chimbal) + SMART METRÔNOMO
   const totalEighths = Math.floor(duration / (beatDur * 0.5));
   for (let e = 0; e < totalEighths; e++) {
     const startSample = Math.floor(e * beatDur * 0.5 * sampleRate);
@@ -165,7 +188,7 @@ export function synthesizeSongStems(ctx, song, pitchSemitones = 0) {
     }
   }
 
-  // 3. SÍNTESE DE CONTRABAIXO + 4. HARMONIA (Transpostos com perfeição matemática)
+  // 3. SÍNTESE DE CONTRABAIXO + 4. HARMONIA
   let bassPhase = 0;
   for (let i = 0; i < totalSamples; i++) {
     const t = i / sampleRate;

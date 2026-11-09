@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { Check } from 'lucide-react';
+import { Check, Upload, AlertCircle } from 'lucide-react';
 import {
   PRESET_SONGS,
   STEM_CONFIG,
@@ -15,6 +15,11 @@ import {
 } from './audio/audioEngine';
 import { separateLocalAudioBufferClientSide } from './audio/dspSeparator';
 import { exportMixToWavBlob } from './audio/wavExporter';
+import {
+  saveTrackToDB,
+  getAllTracksFromDB,
+  deleteTrackFromDB
+} from './audio/audioStorage';
 
 import { CatalogView } from './components/CatalogView';
 import { HeaderHUD } from './components/HeaderHUD';
@@ -33,11 +38,11 @@ export default function App() {
 
   const [songs, setSongs] = useState(() => {
     try {
-      const saved = localStorage.getItem('davi_studio_custom_songs');
+      const saved = localStorage.getItem('davi_studio_songs_metadata');
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) {
-          return [...parsed, ...PRESET_SONGS];
+          return parsed;
         }
       }
     } catch (_) {}
@@ -73,6 +78,9 @@ export default function App() {
   const [backendOnline, setBackendOnline] = useState(false);
   const [toastMessage, setToastMessage] = useState(null);
 
+  // Referência para input de substituição rápida de MP3 no estúdio
+  const replaceAudioInputRef = useRef(null);
+
   // Estado individual das 5 faixas (Stems + Smart Metrônomo)
   const [trackStates, setTrackStates] = useState({
     vocals:    { volume: 1.0, pan: 0, muted: false, solo: false },
@@ -96,6 +104,42 @@ export default function App() {
   const showToast = useCallback((msg) => {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(null), 4000);
+  }, []);
+
+  // Salva lista de músicas no localStorage
+  useEffect(() => {
+    try {
+      const serializable = songs.map((s) => ({
+        id: s.id,
+        title: s.title,
+        artist: s.artist,
+        genre: s.genre,
+        bpm: s.bpm,
+        originalKey: s.originalKey,
+        duration: s.duration,
+        thumbnail: s.thumbnail,
+        coverGradient: s.coverGradient,
+        sections: s.sections,
+        chords: s.chords
+      }));
+      localStorage.setItem('davi_studio_songs_metadata', JSON.stringify(serializable));
+    } catch (_) {}
+  }, [songs]);
+
+  // Carrega faixas customizadas salvas do IndexedDB
+  useEffect(() => {
+    (async () => {
+      try {
+        const storedTracks = await getAllTracksFromDB();
+        if (storedTracks && storedTracks.length > 0) {
+          setSongs((prev) => {
+            const map = new Map(prev.map((s) => [s.id, s]));
+            storedTracks.forEach((t) => map.set(t.id, t));
+            return Array.from(map.values());
+          });
+        }
+      } catch (_) {}
+    })();
   }, []);
 
   const checkLocalBackend = useCallback(async () => {
@@ -200,7 +244,7 @@ export default function App() {
         } catch (_) {}
       }
 
-      // Se a música for de catálogo e o tom mudou, sintetiza no tom exato (Zero artefato metálico!)
+      // Se a música for de catálogo e o tom mudou, sintetiza no tom exato (Zero ruído metálico)
       const needsRegen =
         !stemsDataRef.current?.vocals ||
         synthesizedSongIdRef.current !== activeSong.id ||
@@ -226,7 +270,7 @@ export default function App() {
 
       const clampedOffset = Math.max(
         0,
-        Math.min(activeSong.duration - 0.05, offsetSeconds)
+        Math.min((activeSong.duration || 32) - 0.05, offsetSeconds)
       );
       const anySolo = Object.values(trackStates).some((t) => t.solo);
       const syncStartTime = ctx.currentTime + 0.015;
@@ -283,7 +327,7 @@ export default function App() {
           return;
         }
 
-        if (nextTime >= activeSong.duration) {
+        if (nextTime >= (activeSong.duration || 32)) {
           stopAudioNodes();
           setIsPlaying(false);
           setCurrentTime(0);
@@ -334,7 +378,7 @@ export default function App() {
   };
 
   const handleSeek = (newTime) => {
-    const clamped = Math.max(0, Math.min(activeSong.duration - 0.1, newTime));
+    const clamped = Math.max(0, Math.min((activeSong.duration || 32) - 0.1, newTime));
     setCurrentTime(clamped);
     if (isPlaying) {
       startPlaybackAt(clamped);
@@ -427,12 +471,12 @@ export default function App() {
     showToast('Mixagem exportada em .WAV');
   };
 
-  // Upload Local com Separação DSP Client-side Real
-  const handleLocalFileUpload = async (e) => {
+  // Upload Local com Separação DSP Client-side Real (Salva no IndexedDB)
+  const handleLocalFileUpload = async (e, targetSongId = null) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setIsProcessingImport(true);
-    setProcessingStep('Decodificando arquivo e executando separação DSP Mid-Side...');
+    setProcessingStep('Decodificando arquivo e executando separação DSP Mid-Side no áudio real...');
 
     try {
       const ctx = ensureAudioContext();
@@ -454,14 +498,21 @@ export default function App() {
         });
       }
 
+      // Se for substituição de uma música existente (ex: YouTube -> MP3 Real)
+      const existing = targetSongId ? songs.find((s) => s.id === targetSongId) : null;
+      const songId = targetSongId || `local-${Date.now()}`;
+      const songTitle = existing ? existing.title : file.name.replace(/\.[^/.]+$/, '');
+      const songArtist = existing ? existing.artist : `Arquivo Local • ${detectedBpm} BPM`;
+
       const newSong = {
-        id: `local-${Date.now()}`,
-        title: file.name.replace(/\.[^/.]+$/, ''),
-        artist: `Arquivo Local • ${detectedBpm} BPM Detectado`,
+        id: songId,
+        title: songTitle,
+        artist: songArtist,
         bpm: detectedBpm,
-        originalKey: 'Am',
+        originalKey: existing?.originalKey || 'Am',
         duration: decoded.duration,
-        coverGradient: 'from-cyan-600 via-teal-700 to-slate-900',
+        thumbnail: existing?.thumbnail,
+        coverGradient: existing?.coverGradient || 'from-cyan-600 via-teal-700 to-slate-900',
         customStems,
         sections: [
           { name: 'Intro', start: 0, end: Math.round(decoded.duration * 0.25) },
@@ -479,12 +530,19 @@ export default function App() {
         chords: generatedChords
       };
 
-      setSongs((prev) => [newSong, ...prev]);
+      setSongs((prev) => {
+        const withoutOld = prev.filter((s) => s.id !== songId);
+        return [newSong, ...withoutOld];
+      });
+
+      // Salva no IndexedDB
+      saveTrackToDB(newSong);
+
       setActiveSongId(newSong.id);
       setShowImportModal(false);
       setCurrentPage('studio');
       setMobileTab('mixer');
-      showToast(`Música "${newSong.title}" separada com sucesso em 4 faixas!`);
+      showToast(`Áudio real de "${songTitle}" separado em 4 faixas!`);
     } catch (_) {
       showToast('Erro ao decodificar arquivo de áudio');
     } finally {
@@ -493,7 +551,7 @@ export default function App() {
     }
   };
 
-  // Importação do YouTube Resiliente com busca de metadados reais (oEmbed) e extração de Stems
+  // Importação do YouTube Resiliente
   const handleYoutubeImport = async (e) => {
     e.preventDefault();
     if (!youtubeUrl.trim()) return;
@@ -596,23 +654,24 @@ export default function App() {
         };
 
         setSongs((prev) => [newSong, ...prev]);
+        saveTrackToDB(newSong);
         setActiveSongId(newSong.id);
         setProcessingJob(null);
         setIsProcessingImport(false);
         setYoutubeUrl('');
-        showToast(`Faixa "${videoTitle}" adicionada com sucesso ao seu catálogo!`);
+        showToast(`Faixa "${videoTitle}" processada pelo Demucs v4!`);
         return;
       } catch (err) {
-        console.warn('Erro com backend localhost, usando sintetizador multitrack dedicado', err);
+        console.warn('Erro com backend localhost', err);
       }
     }
 
     // Modo Standalone Web: Pipeline com progresso animado no catálogo
     const pipelineSteps = [
-      { msg: '1/4 • Extraindo fluxo de áudio do YouTube...', pct: 30 },
-      { msg: '2/4 • Executando separação em 4 stems independentes...', pct: 60 },
-      { msg: '3/4 • Mapeando BPM, downbeat e sincronizando Metrônomo...', pct: 85 },
-      { msg: '4/4 • Gerando grade de acordes e formas de onda...', pct: 100 }
+      { msg: '1/4 • Identificando vídeo e metadados no YouTube...', pct: 30 },
+      { msg: '2/4 • Mapeando tonalidade e progressão de acordes...', pct: 60 },
+      { msg: '3/4 • Sincronizando Smart Metrônomo e BPM...', pct: 85 },
+      { msg: '4/4 • Gerando canais multitrack e formas de onda...', pct: 100 }
     ];
 
     for (const step of pipelineSteps) {
@@ -651,6 +710,7 @@ export default function App() {
     };
 
     setSongs((prev) => [newSong, ...prev]);
+    saveTrackToDB(newSong);
     setActiveSongId(newSong.id);
     setProcessingJob(null);
     setIsProcessingImport(false);
@@ -665,12 +725,19 @@ export default function App() {
     showToast('Música Demo carregada no Estúdio!');
   };
 
-  const handleDeleteSong = (idToDelete) => {
+  const handleDeleteSong = async (idToDelete) => {
     setSongs((prev) => prev.filter((s) => s.id !== idToDelete));
+    await deleteTrackFromDB(idToDelete);
     if (activeSongId === idToDelete) {
       setActiveSongId(PRESET_SONGS[0].id);
     }
     showToast('Música removida da biblioteca');
+  };
+
+  const handleResetCatalog = () => {
+    setSongs(PRESET_SONGS);
+    localStorage.removeItem('davi_studio_songs_metadata');
+    showToast('Catálogo original restaurado!');
   };
 
   const currentKey = useMemo(
@@ -679,13 +746,13 @@ export default function App() {
   );
 
   const currentBpm = useMemo(
-    () => Math.round(activeSong.bpm * playbackSpeed),
+    () => Math.round((activeSong.bpm || 120) * playbackSpeed),
     [activeSong.bpm, playbackSpeed]
   );
 
   const transposedChords = useMemo(
     () =>
-      activeSong.chords.map((c) => ({
+      (activeSong.chords || []).map((c) => ({
         ...c,
         transposed: transposeChord(c.chord, pitchSemitones)
       })),
@@ -703,7 +770,7 @@ export default function App() {
   const nextChordObj = transposedChords[activeChordIndex + 1] || { transposed: 'Fim' };
 
   const currentBeatNumber = useMemo(() => {
-    const beatDur = 60 / activeSong.bpm;
+    const beatDur = 60 / (activeSong.bpm || 120);
     return (Math.floor(currentTime / beatDur) % 4) + 1;
   }, [currentTime, activeSong.bpm]);
 
@@ -719,7 +786,7 @@ export default function App() {
     return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${ms}`;
   };
 
-  // Se o usuário estiver na tela de Catálogo (como no Moises AI)
+  // Se o usuário estiver na tela de Catálogo (Estilo Moises AI)
   if (currentPage === 'catalog') {
     return (
       <>
@@ -743,7 +810,7 @@ export default function App() {
           backendOnline={backendOnline}
           processingJob={processingJob}
           onDeleteSong={handleDeleteSong}
-          onLoadDemoTrack={handleLoadDemoTrack}
+          onResetCatalog={handleResetCatalog}
         />
 
         {/* Modal 1: Importar Música */}
@@ -774,6 +841,15 @@ export default function App() {
   // Se o usuário estiver na tela de Estúdio / Mixer Multitrack
   return (
     <div className="h-[100dvh] max-h-[100dvh] overflow-hidden bg-[#090D0B] text-slate-100 flex flex-col font-sans selection:bg-emerald-500/30">
+      {/* Input invisível para substituição rápida de áudio real */}
+      <input
+        ref={replaceAudioInputRef}
+        type="file"
+        accept="audio/*"
+        onChange={(e) => handleLocalFileUpload(e, activeSong.id)}
+        className="hidden"
+      />
+
       {/* Notificação Flutuante Toast */}
       {toastMessage && (
         <div className="fixed top-16 right-4 z-50 flex items-center gap-2 bg-slate-900/95 border border-emerald-500/50 text-slate-100 px-3.5 py-2 rounded-xl shadow-2xl">
@@ -840,6 +916,26 @@ export default function App() {
         }}
       />
 
+      {/* Banner Informativo Se for Faixa Sintética do YouTube sem Arquivo MP3 */}
+      {activeSong.id.startsWith('yt-') && !activeSong.customStems && (
+        <div className="bg-amber-950/30 border-b border-amber-500/30 px-3 py-1.5 flex items-center justify-between gap-2 text-xs text-amber-200 shrink-0">
+          <div className="flex items-center gap-1.5 truncate">
+            <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            <span className="truncate">
+              Faixa importada do YouTube em prévia multitrack. Deseja separar o áudio REAL do seu arquivo MP3?
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => replaceAudioInputRef.current?.click()}
+            className="px-2.5 py-0.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/50 text-[11px] font-bold flex items-center gap-1 shrink-0 transition-colors"
+          >
+            <Upload className="w-3 h-3" />
+            <span>Enviar MP3 Real</span>
+          </button>
+        </div>
+      )}
+
       {/* Corpo Principal do Estúdio */}
       <div className="flex-1 flex flex-col lg:flex-row min-h-0 overflow-hidden">
         {/* Barra Lateral de Biblioteca Rápida */}
@@ -905,7 +1001,7 @@ export default function App() {
                   isAudible={isAudible}
                   progress={activeSong.duration > 0 ? currentTime / activeSong.duration : 0}
                   loopRange={loopRange}
-                  duration={activeSong.duration}
+                  duration={activeSong.duration || 32}
                   onToggleMute={handleToggleMute}
                   onToggleSolo={handleToggleSolo}
                   onChangeVolume={handleChangeVolume}
