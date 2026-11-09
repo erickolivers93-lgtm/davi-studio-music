@@ -27,6 +27,36 @@ export function transposeChord(chordStr, semitones) {
   });
 }
 
+/**
+ * Retorna as 25 tonalidades cromáticas possíveis (-12 a +12 semitons) a partir do tom original
+ */
+export function getAvailableKeys(originalKey = 'Am') {
+  const keys = [];
+  for (let s = -12; s <= 12; s++) {
+    const keyName = transposeChord(originalKey, s);
+    const sign = s > 0 ? `+${s}` : `${s}`;
+    let label = `${keyName} (${sign} st)`;
+    if (s === 0) label = `${keyName} (Tom Original)`;
+    keys.push({
+      semitones: s,
+      keyName,
+      label,
+      isOriginal: s === 0
+    });
+  }
+  return keys;
+}
+
+/**
+ * Extrai o ID do vídeo do YouTube de qualquer formato de link (watch, youtu.be, shorts, mobile, embed)
+ */
+export function parseYoutubeId(url) {
+  if (!url) return null;
+  const regExp = /(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=|shorts\/))([\w-]{11})/;
+  const match = url.trim().match(regExp);
+  return match ? match[1] : null;
+}
+
 // Dicionário de posições de acordes para o diagrama visual (Violão/Guitarra e Piano)
 export const CHORD_SHAPES = {
   'C':    { frets: [-1, 3, 2, 0, 1, 0], piano: [0, 4, 7] },
@@ -91,8 +121,10 @@ export const PRESET_SONGS = [
     id: 'neon-groove',
     title: 'Midnight Neon Groove',
     artist: 'DAVI Studio • Soul / Funk',
+    genre: 'Soul / Funk',
     bpm: 108,
     originalKey: 'Am',
+    coverGradient: 'from-purple-600 via-indigo-600 to-slate-900',
     duration: Number((((60 / 108) * 4) * 16).toFixed(2)),
     sections: buildSongSectionsByBpm(108, ['Intro', 'Verso 1', 'Refrão', 'Solo / Outro']),
     chords: buildSongChordsByBpm(108, [
@@ -118,8 +150,10 @@ export const PRESET_SONGS = [
     id: 'southern-rock',
     title: 'Highway Overdrive',
     artist: 'DAVI Studio • Classic Rock',
+    genre: 'Classic Rock',
     bpm: 120,
     originalKey: 'G',
+    coverGradient: 'from-amber-500 via-orange-600 to-stone-900',
     duration: Number((((60 / 120) * 4) * 16).toFixed(2)),
     sections: buildSongSectionsByBpm(120, ['Riff Inicial', 'Estrofe', 'Refrão Forte', 'Lead Final']),
     chords: buildSongChordsByBpm(120, [
@@ -145,8 +179,10 @@ export const PRESET_SONGS = [
     id: 'bossa-session',
     title: 'Tarde em Copacabana',
     artist: 'DAVI Studio • Bossa / MPB',
+    genre: 'Bossa / MPB',
     bpm: 96,
     originalKey: 'Dm',
+    coverGradient: 'from-emerald-600 via-teal-700 to-zinc-900',
     duration: Number((((60 / 96) * 4) * 16).toFixed(2)),
     sections: buildSongSectionsByBpm(96, ['Tema A', 'Tema B', 'Modulação', 'Coda']),
     chords: buildSongChordsByBpm(96, [

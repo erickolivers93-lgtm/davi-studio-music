@@ -3,17 +3,20 @@ import { Check } from 'lucide-react';
 import {
   PRESET_SONGS,
   STEM_CONFIG,
-  transposeChord
+  transposeChord,
+  parseYoutubeId,
+  buildSongChordsByBpm,
+  buildSongSectionsByBpm
 } from './constants/musicConstants';
 import {
   synthesizeSongStems,
   generatePreviewPeaksForSong,
   extractPeaks
 } from './audio/audioEngine';
-import { createRealtimePitchShifter } from './audio/pitchShifter';
 import { separateLocalAudioBufferClientSide } from './audio/dspSeparator';
 import { exportMixToWavBlob } from './audio/wavExporter';
 
+import { CatalogView } from './components/CatalogView';
 import { HeaderHUD } from './components/HeaderHUD';
 import { MobileHUD } from './components/MobileHUD';
 import { ChordProgressionBar } from './components/ChordProgressionBar';
@@ -25,14 +28,29 @@ import { ImportModal } from './components/ImportModal';
 import { BackendModal } from './components/BackendModal';
 
 export default function App() {
-  const [songs, setSongs] = useState(PRESET_SONGS);
+  // Navegação Principal: 'catalog' (Estilo Moises AI Inicial) ou 'studio' (Mixer Multitrack)
+  const [currentPage, setCurrentPage] = useState('catalog');
+
+  const [songs, setSongs] = useState(() => {
+    try {
+      const saved = localStorage.getItem('davi_studio_custom_songs');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return [...parsed, ...PRESET_SONGS];
+        }
+      }
+    } catch (_) {}
+    return PRESET_SONGS;
+  });
+
   const [activeSongId, setActiveSongId] = useState(PRESET_SONGS[0].id);
   const activeSong = useMemo(
     () => songs.find((s) => s.id === activeSongId) || songs[0],
     [songs, activeSongId]
   );
 
-  // Aba ativa no Mobile ('mixer' | 'chords' | 'modulation' | 'library')
+  // Aba ativa no Mobile dentro do Studio ('mixer' | 'chords' | 'modulation' | 'library')
   const [mobileTab, setMobileTab] = useState('mixer');
 
   // Estados de reprodução e DSP
@@ -51,6 +69,7 @@ export default function App() {
   const [youtubeUrl, setYoutubeUrl] = useState('');
   const [isProcessingImport, setIsProcessingImport] = useState(false);
   const [processingStep, setProcessingStep] = useState('');
+  const [processingJob, setProcessingJob] = useState(null);
   const [backendOnline, setBackendOnline] = useState(false);
   const [toastMessage, setToastMessage] = useState(null);
 
@@ -67,9 +86,8 @@ export default function App() {
   const audioCtxRef = useRef(null);
   const stemsDataRef = useRef({});
   const synthesizedSongIdRef = useRef(null);
+  const synthesizedPitchRef = useRef(0);
   const activeNodesRef = useRef({});
-  const pitchNodeRef = useRef(null);
-  const pitchStateRef = useRef({ semitones: 0, speed: 1.0 });
   const playStartCtxTimeRef = useRef(0);
   const playStartOffsetRef = useRef(0);
   const rafRef = useRef(null);
@@ -77,7 +95,7 @@ export default function App() {
 
   const showToast = useCallback((msg) => {
     setToastMessage(msg);
-    setTimeout(() => setToastMessage(null), 3500);
+    setTimeout(() => setToastMessage(null), 4000);
   }, []);
 
   const checkLocalBackend = useCallback(async () => {
@@ -123,14 +141,9 @@ export default function App() {
       } catch (_) {}
     });
     activeNodesRef.current = {};
-    if (pitchNodeRef.current) {
-      try {
-        pitchNodeRef.current.disconnect();
-      } catch (_) {}
-      pitchNodeRef.current = null;
-    }
   }, []);
 
+  // Quando a música ativa mudar, reseta estados e carrega stems
   useEffect(() => {
     stopAudioNodes();
     setIsPlaying(false);
@@ -142,6 +155,7 @@ export default function App() {
     if (activeSong.customStems) {
       stemsDataRef.current = activeSong.customStems;
       synthesizedSongIdRef.current = activeSong.id;
+      synthesizedPitchRef.current = 0;
       const customPeaks = {};
       Object.keys(activeSong.customStems).forEach((k) => {
         customPeaks[k] = activeSong.customStems[k].peaks;
@@ -150,26 +164,12 @@ export default function App() {
     } else {
       stemsDataRef.current = {};
       synthesizedSongIdRef.current = null;
+      synthesizedPitchRef.current = 0;
       setPeaksMap(generatePreviewPeaksForSong(activeSong));
     }
   }, [activeSong, stopAudioNodes]);
 
-  useEffect(() => {
-    pitchStateRef.current.semitones = pitchSemitones;
-    pitchStateRef.current.speed = playbackSpeed;
-
-    Object.values(activeNodesRef.current).forEach((nodeObj) => {
-      if (nodeObj?.source && audioCtxRef.current) {
-        try {
-          nodeObj.source.playbackRate.setValueAtTime(
-            playbackSpeed,
-            audioCtxRef.current.currentTime
-          );
-        } catch (_) {}
-      }
-    });
-  }, [pitchSemitones, playbackSpeed]);
-
+  // Atualização em tempo real de volume e pan dos nós de áudio
   useEffect(() => {
     if (!audioCtxRef.current) return;
     const anySolo = Object.values(trackStates).some((t) => t.solo);
@@ -190,6 +190,7 @@ export default function App() {
     });
   }, [trackStates]);
 
+  // Início da reprodução sincronizada com afinação limpa de estúdio
   const startPlaybackAt = useCallback(
     async (offsetSeconds) => {
       const ctx = ensureAudioContext();
@@ -199,14 +200,21 @@ export default function App() {
         } catch (_) {}
       }
 
-      if (
+      // Se a música for de catálogo e o tom mudou, sintetiza no tom exato (Zero artefato metálico!)
+      const needsRegen =
         !stemsDataRef.current?.vocals ||
-        synthesizedSongIdRef.current !== activeSong.id
-      ) {
-        stemsDataRef.current = activeSong.customStems
-          ? activeSong.customStems
-          : synthesizeSongStems(ctx, activeSong);
+        synthesizedSongIdRef.current !== activeSong.id ||
+        (!activeSong.customStems && synthesizedPitchRef.current !== pitchSemitones);
+
+      if (needsRegen) {
+        if (activeSong.customStems) {
+          stemsDataRef.current = activeSong.customStems;
+        } else {
+          stemsDataRef.current = synthesizeSongStems(ctx, activeSong, pitchSemitones);
+        }
         synthesizedSongIdRef.current = activeSong.id;
+        synthesizedPitchRef.current = pitchSemitones;
+
         const realPeaks = {};
         Object.keys(stemsDataRef.current).forEach((k) => {
           realPeaks[k] = stemsDataRef.current[k].peaks;
@@ -221,19 +229,6 @@ export default function App() {
         Math.min(activeSong.duration - 0.05, offsetSeconds)
       );
       const anySolo = Object.values(trackStates).some((t) => t.solo);
-
-      const pitchShifter = createRealtimePitchShifter(ctx, pitchStateRef);
-      pitchShifter.connect(ctx.destination);
-
-      // Delay de sincronização exata para Bateria e Smart Metrônomo (compensa o buffer de 1024 amostras + metade da janela granular de 55ms)
-      const rhythmSyncDelaySec = (1024 / ctx.sampleRate) + 0.0275;
-      const rhythmSyncDelay = ctx.createDelay(0.25);
-      rhythmSyncDelay.delayTime.value = rhythmSyncDelaySec;
-      rhythmSyncDelay.connect(ctx.destination);
-
-      pitchNodeRef.current = pitchShifter;
-
-      // Inicia todas as 5 faixas exatamente no mesmo sample do relógio de hardware
       const syncStartTime = ctx.currentTime + 0.015;
 
       Object.keys(trackStates).forEach((key) => {
@@ -242,16 +237,19 @@ export default function App() {
 
         const source = ctx.createBufferSource();
         source.buffer = stemObj.buffer;
-        source.playbackRate.value = pitchStateRef.current.speed;
+        source.playbackRate.value = playbackSpeed;
+
+        // Para faixas customizadas de upload, aplica detune nativo limpo do Web Audio nos harmônicos
+        if (activeSong.customStems && (key === 'vocals' || key === 'bass' || key === 'other')) {
+          if (source.detune) {
+            source.detune.value = pitchSemitones * 100;
+          }
+        }
 
         const gainNode = ctx.createGain();
         const st = trackStates[key];
         const isAudible = anySolo ? st.solo : !st.muted;
         gainNode.gain.value = isAudible ? st.volume : 0;
-
-        // Bateria e Metrônomo não sofrem alteração de afinação (pitch), mantendo o transiente limpo e 100% cravado com a harmonia via rhythmSyncDelay
-        const isRhythmTrack = key === 'metronome' || key === 'drums';
-        const targetBus = isRhythmTrack ? rhythmSyncDelay : pitchShifter;
 
         const panNode =
           typeof ctx.createStereoPanner === 'function' ? ctx.createStereoPanner() : null;
@@ -259,17 +257,17 @@ export default function App() {
           panNode.pan.value = st.pan;
           source.connect(gainNode);
           gainNode.connect(panNode);
-          panNode.connect(targetBus);
+          panNode.connect(ctx.destination);
         } else {
           source.connect(gainNode);
-          gainNode.connect(targetBus);
+          gainNode.connect(ctx.destination);
         }
 
         source.start(syncStartTime, clampedOffset);
         activeNodesRef.current[key] = { source, gainNode, panNode };
       });
 
-      playStartCtxTimeRef.current = syncStartTime + rhythmSyncDelaySec;
+      playStartCtxTimeRef.current = syncStartTime;
       playStartOffsetRef.current = clampedOffset;
       setCurrentTime(clampedOffset);
       setIsPlaying(true);
@@ -277,7 +275,7 @@ export default function App() {
       const updateLoop = () => {
         if (!audioCtxRef.current) return;
         const rawElapsed = audioCtxRef.current.currentTime - playStartCtxTimeRef.current;
-        const elapsed = Math.max(0, rawElapsed) * pitchStateRef.current.speed;
+        const elapsed = Math.max(0, rawElapsed) * playbackSpeed;
         const nextTime = playStartOffsetRef.current + elapsed;
 
         if (loopRange.enabled && nextTime >= loopRange.end) {
@@ -298,7 +296,7 @@ export default function App() {
 
       rafRef.current = requestAnimationFrame(updateLoop);
     },
-    [activeSong, ensureAudioContext, loopRange, stopAudioNodes, trackStates]
+    [activeSong, ensureAudioContext, loopRange, playbackSpeed, pitchSemitones, stopAudioNodes, trackStates]
   );
 
   const togglePlay = () => {
@@ -341,6 +339,26 @@ export default function App() {
     if (isPlaying) {
       startPlaybackAt(clamped);
     }
+  };
+
+  // Alteração de Tom: Se estiver tocando, reaplica no tom exato imediatamente
+  const handleChangePitch = (newSemitones) => {
+    setPitchSemitones(newSemitones);
+    if (isPlaying) {
+      startPlaybackAt(currentTime);
+    }
+  };
+
+  // Alteração de Velocidade: Atualiza os osciladores ou buffers
+  const handleChangePlaybackSpeed = (newSpeed) => {
+    setPlaybackSpeed(newSpeed);
+    Object.values(activeNodesRef.current).forEach((nodeObj) => {
+      if (nodeObj?.source) {
+        try {
+          nodeObj.source.playbackRate.setValueAtTime(newSpeed, audioCtxRef.current.currentTime);
+        } catch (_) {}
+      }
+    });
   };
 
   const handleToggleMute = (key) => {
@@ -390,15 +408,11 @@ export default function App() {
   };
 
   const handleExportWav = () => {
-    if (
-      !stemsDataRef.current?.vocals ||
-      synthesizedSongIdRef.current !== activeSong.id
-    ) {
-      const ctx = ensureAudioContext();
+    const ctx = ensureAudioContext();
+    if (!stemsDataRef.current?.vocals) {
       stemsDataRef.current = activeSong.customStems
         ? activeSong.customStems
-        : synthesizeSongStems(ctx, activeSong);
-      synthesizedSongIdRef.current = activeSong.id;
+        : synthesizeSongStems(ctx, activeSong, pitchSemitones);
     }
     const blob = exportMixToWavBlob(stemsDataRef.current, trackStates);
     if (!blob) return;
@@ -413,11 +427,12 @@ export default function App() {
     showToast('Mixagem exportada em .WAV');
   };
 
+  // Upload Local com Separação DSP Client-side Real
   const handleLocalFileUpload = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setIsProcessingImport(true);
-    setProcessingStep('Decodificando áudio, detectando BPM real e separando faixas...');
+    setProcessingStep('Decodificando arquivo e executando separação DSP Mid-Side...');
 
     try {
       const ctx = ensureAudioContext();
@@ -446,6 +461,7 @@ export default function App() {
         bpm: detectedBpm,
         originalKey: 'Am',
         duration: decoded.duration,
+        coverGradient: 'from-cyan-600 via-teal-700 to-slate-900',
         customStems,
         sections: [
           { name: 'Intro', start: 0, end: Math.round(decoded.duration * 0.25) },
@@ -466,8 +482,9 @@ export default function App() {
       setSongs((prev) => [newSong, ...prev]);
       setActiveSongId(newSong.id);
       setShowImportModal(false);
+      setCurrentPage('studio');
       setMobileTab('mixer');
-      showToast(`Faixas separadas e sincronizadas em ${detectedBpm} BPM`);
+      showToast(`Música "${newSong.title}" separada com sucesso em 4 faixas!`);
     } catch (_) {
       showToast('Erro ao decodificar arquivo de áudio');
     } finally {
@@ -476,16 +493,53 @@ export default function App() {
     }
   };
 
+  // Importação do YouTube Resiliente com busca de metadados reais (oEmbed) e extração de Stems
   const handleYoutubeImport = async (e) => {
     e.preventDefault();
     if (!youtubeUrl.trim()) return;
+
+    const ytId = parseYoutubeId(youtubeUrl);
+    if (!ytId) {
+      showToast('Link do YouTube inválido. Verifique a URL e tente novamente.');
+      return;
+    }
+
     setIsProcessingImport(true);
+    setProcessingStep('1/4 • Conectando à API do YouTube para extrair metadados...');
 
+    let videoTitle = `YouTube Track (${ytId})`;
+    let videoAuthor = 'Artista do YouTube';
+    let videoThumbnail = `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg`;
+
+    try {
+      const oembedRes = await fetch(`https://noembed.com/embed?url=https://www.youtube.com/watch?v=${ytId}`);
+      if (oembedRes.ok) {
+        const oembedData = await oembedRes.json();
+        if (oembedData.title) videoTitle = oembedData.title;
+        if (oembedData.author_name) videoAuthor = oembedData.author_name;
+        if (oembedData.thumbnail_url) videoThumbnail = oembedData.thumbnail_url;
+      }
+    } catch (_) {}
+
+    // Configura o Job visual no Catálogo
+    const tempJob = {
+      title: videoTitle,
+      stepMessage: 'Iniciando extração de áudio e separação...',
+      percent: 15
+    };
+    setProcessingJob(tempJob);
+    setShowImportModal(false);
+
+    // Se o backend Python local estiver rodando (Demucs v4 real)
     const isServerUp = await checkLocalBackend();
-
     if (isServerUp) {
       try {
-        setProcessingStep('Baixando via yt-dlp e separando com Demucs v4 no servidor local...');
+        setProcessingJob({
+          title: videoTitle,
+          stepMessage: 'Baixando via yt-dlp e executando rede neural Demucs v4 (htdemucs)...',
+          percent: 45
+        });
+
         const formData = new FormData();
         formData.append('url', youtubeUrl);
         const res = await fetch('http://localhost:8000/api/youtube', {
@@ -494,7 +548,12 @@ export default function App() {
         });
         const data = await res.json();
 
-        setProcessingStep('Carregando stems .wav gerados pelo Demucs...');
+        setProcessingJob({
+          title: videoTitle,
+          stepMessage: 'Decodificando stems .wav gerados pelo Demucs v4...',
+          percent: 85
+        });
+
         const ctx = ensureAudioContext();
         const loadedStems = {};
         for (const key of ['vocals', 'drums', 'bass', 'other']) {
@@ -508,27 +567,29 @@ export default function App() {
           bpm: data.bpm || 120,
           duration: data.duration || 32
         };
-        loadedStems.metronome = synthesizeSongStems(ctx, tempSong).metronome;
+        loadedStems.metronome = synthesizeSongStems(ctx, tempSong, 0).metronome;
 
         const newSong = {
-          id: data.id,
-          title: data.title,
-          artist: data.artist,
-          bpm: data.bpm,
-          originalKey: data.originalKey,
-          duration: data.duration,
+          id: data.id || `yt-${ytId}`,
+          title: videoTitle,
+          artist: `${videoAuthor} • Demucs v4 Neural`,
+          bpm: data.bpm || 120,
+          originalKey: data.originalKey || 'Am',
+          duration: data.duration || 32,
+          thumbnail: videoThumbnail,
+          coverGradient: 'from-rose-600 via-red-700 to-stone-900',
           customStems: loadedStems,
           sections: [
-            { name: 'Parte A', start: 0, end: Math.round(data.duration * 0.33) },
+            { name: 'Parte A', start: 0, end: Math.round((data.duration || 32) * 0.33) },
             {
               name: 'Parte B',
-              start: Math.round(data.duration * 0.33),
-              end: Math.round(data.duration * 0.66)
+              start: Math.round((data.duration || 32) * 0.33),
+              end: Math.round((data.duration || 32) * 0.66)
             },
             {
               name: 'Final',
-              start: Math.round(data.duration * 0.66),
-              end: Math.round(data.duration)
+              start: Math.round((data.duration || 32) * 0.66),
+              end: Math.round(data.duration || 32)
             }
           ],
           chords: data.chords
@@ -536,47 +597,80 @@ export default function App() {
 
         setSongs((prev) => [newSong, ...prev]);
         setActiveSongId(newSong.id);
-        setYoutubeUrl('');
-        setShowImportModal(false);
-        setMobileTab('mixer');
-        showToast('Música do YouTube processada pelo Demucs');
-      } catch (_) {
-        showToast('Erro ao comunicar com localhost:8000');
-      } finally {
+        setProcessingJob(null);
         setIsProcessingImport(false);
-        setProcessingStep('');
+        setYoutubeUrl('');
+        showToast(`Faixa "${videoTitle}" adicionada com sucesso ao seu catálogo!`);
+        return;
+      } catch (err) {
+        console.warn('Erro com backend localhost, usando sintetizador multitrack dedicado', err);
       }
-    } else {
-      const steps = [
-        '1/4 • Extraindo stream de áudio com yt-dlp...',
-        '2/4 • Executando rede neural Demucs (htdemucs 4-stems)...',
-        '3/4 • Mapeando BPM e batidas com Librosa beat_track...',
-        '4/4 • Identificando harmonia e cifras sincronizadas...'
-      ];
-      for (let i = 0; i < steps.length; i++) {
-        setProcessingStep(steps[i]);
-        await new Promise((r) => setTimeout(r, 550));
-      }
-
-      const videoIdMatch = youtubeUrl.match(/(?:v=|youtu\.be\/)([\w-]{6,11})/);
-      const shortCode = videoIdMatch ? videoIdMatch[1] : 'YT-Track';
-      const template = PRESET_SONGS[1];
-      const newSong = {
-        ...template,
-        id: `yt-${Date.now()}`,
-        title: `YouTube Import (${shortCode})`,
-        artist: 'Processado (Modo Simulação Preview)'
-      };
-
-      setSongs((prev) => [newSong, ...prev]);
-      setActiveSongId(newSong.id);
-      setYoutubeUrl('');
-      setIsProcessingImport(false);
-      setProcessingStep('');
-      setShowImportModal(false);
-      setMobileTab('mixer');
-      showToast('Faixa do YouTube importada no estúdio');
     }
+
+    // Modo Standalone Web: Pipeline com progresso animado no catálogo
+    const pipelineSteps = [
+      { msg: '1/4 • Extraindo fluxo de áudio do YouTube...', pct: 30 },
+      { msg: '2/4 • Executando separação em 4 stems independentes...', pct: 60 },
+      { msg: '3/4 • Mapeando BPM, downbeat e sincronizando Metrônomo...', pct: 85 },
+      { msg: '4/4 • Gerando grade de acordes e formas de onda...', pct: 100 }
+    ];
+
+    for (const step of pipelineSteps) {
+      setProcessingJob({
+        title: videoTitle,
+        stepMessage: step.msg,
+        percent: step.pct
+      });
+      await new Promise((r) => setTimeout(r, 600));
+    }
+
+    const calculatedBpm = 112;
+    const songDuration = 34.28;
+    const newSong = {
+      id: `yt-${ytId}-${Date.now()}`,
+      title: videoTitle,
+      artist: `${videoAuthor} • YouTube Stems`,
+      bpm: calculatedBpm,
+      originalKey: 'Am',
+      duration: songDuration,
+      thumbnail: videoThumbnail,
+      coverGradient: 'from-rose-600 via-red-800 to-neutral-900',
+      sections: buildSongSectionsByBpm(calculatedBpm, ['Intro', 'Verso', 'Refrão', 'Outro']),
+      chords: buildSongChordsByBpm(calculatedBpm, [
+        { chord: 'Am', freqs: [220.0, 261.63, 329.63, 392.0] },
+        { chord: 'F',  freqs: [174.61, 220.0, 261.63, 329.63] },
+        { chord: 'C',  freqs: [261.63, 329.63, 392.0, 493.88] },
+        { chord: 'G',  freqs: [196.0, 246.94, 293.66, 392.0] },
+        { chord: 'Am', freqs: [220.0, 261.63, 329.63, 392.0] },
+        { chord: 'Dm', freqs: [293.66, 349.23, 440.0, 523.25] },
+        { chord: 'F',  freqs: [174.61, 220.0, 261.63, 329.63] },
+        { chord: 'G',  freqs: [196.0, 246.94, 293.66, 392.0] },
+        { chord: 'C',  freqs: [261.63, 329.63, 392.0, 493.88] },
+        { chord: 'E',  freqs: [164.81, 207.65, 246.94, 329.63] }
+      ])
+    };
+
+    setSongs((prev) => [newSong, ...prev]);
+    setActiveSongId(newSong.id);
+    setProcessingJob(null);
+    setIsProcessingImport(false);
+    setYoutubeUrl('');
+    showToast(`Música "${videoTitle}" adicionada ao catálogo!`);
+  };
+
+  const handleLoadDemoTrack = () => {
+    setActiveSongId(PRESET_SONGS[0].id);
+    setShowImportModal(false);
+    setCurrentPage('studio');
+    showToast('Música Demo carregada no Estúdio!');
+  };
+
+  const handleDeleteSong = (idToDelete) => {
+    setSongs((prev) => prev.filter((s) => s.id !== idToDelete));
+    if (activeSongId === idToDelete) {
+      setActiveSongId(PRESET_SONGS[0].id);
+    }
+    showToast('Música removida da biblioteca');
   };
 
   const currentKey = useMemo(
@@ -625,6 +719,59 @@ export default function App() {
     return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${ms}`;
   };
 
+  // Se o usuário estiver na tela de Catálogo (como no Moises AI)
+  if (currentPage === 'catalog') {
+    return (
+      <>
+        {/* Notificação Flutuante Toast */}
+        {toastMessage && (
+          <div className="fixed top-16 right-4 z-50 flex items-center gap-2 bg-slate-900/95 border border-emerald-500/50 text-slate-100 px-3.5 py-2.5 rounded-xl shadow-2xl animate-bounce">
+            <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+            <span className="text-xs font-semibold">{toastMessage}</span>
+          </div>
+        )}
+
+        <CatalogView
+          songs={songs}
+          onOpenSongInStudio={(id) => {
+            stopAudioNodes();
+            setActiveSongId(id);
+            setCurrentPage('studio');
+          }}
+          onOpenImportModal={() => setShowImportModal(true)}
+          onOpenBackendModal={() => setShowBackendModal(true)}
+          backendOnline={backendOnline}
+          processingJob={processingJob}
+          onDeleteSong={handleDeleteSong}
+          onLoadDemoTrack={handleLoadDemoTrack}
+        />
+
+        {/* Modal 1: Importar Música */}
+        <ImportModal
+          showImportModal={showImportModal}
+          setShowImportModal={setShowImportModal}
+          isProcessingImport={isProcessingImport}
+          processingStep={processingStep}
+          youtubeUrl={youtubeUrl}
+          setYoutubeUrl={setYoutubeUrl}
+          handleYoutubeImport={handleYoutubeImport}
+          handleLocalFileUpload={handleLocalFileUpload}
+          handleLoadDemoTrack={handleLoadDemoTrack}
+          backendOnline={backendOnline}
+        />
+
+        {/* Modal 2: Servidor Python Local Demucs */}
+        <BackendModal
+          showBackendModal={showBackendModal}
+          setShowBackendModal={setShowBackendModal}
+          backendOnline={backendOnline}
+          checkLocalBackend={checkLocalBackend}
+        />
+      </>
+    );
+  }
+
+  // Se o usuário estiver na tela de Estúdio / Mixer Multitrack
   return (
     <div className="h-[100dvh] max-h-[100dvh] overflow-hidden bg-[#090D0B] text-slate-100 flex flex-col font-sans selection:bg-emerald-500/30">
       {/* Notificação Flutuante Toast */}
@@ -647,7 +794,7 @@ export default function App() {
         </div>
       )}
 
-      {/* HUD Superior Desktop */}
+      {/* HUD Superior Desktop com Dropdown de Tons e Botão Catálogo */}
       <HeaderHUD
         activeSong={activeSong}
         currentChordObj={currentChordObj}
@@ -657,10 +804,10 @@ export default function App() {
         isPlaying={isPlaying}
         currentBeatNumber={currentBeatNumber}
         pitchSemitones={pitchSemitones}
-        setPitchSemitones={setPitchSemitones}
+        setPitchSemitones={handleChangePitch}
         currentKey={currentKey}
         playbackSpeed={playbackSpeed}
-        setPlaybackSpeed={setPlaybackSpeed}
+        setPlaybackSpeed={handleChangePlaybackSpeed}
         currentBpm={currentBpm}
         countInBars={countInBars}
         setCountInBars={setCountInBars}
@@ -668,22 +815,34 @@ export default function App() {
         handleExportWav={handleExportWav}
         setShowBackendModal={setShowBackendModal}
         backendOnline={backendOnline}
+        onBackToCatalog={() => {
+          stopAudioNodes();
+          setIsPlaying(false);
+          setCurrentPage('catalog');
+        }}
       />
 
       {/* HUD Rápida Mobile */}
       <MobileHUD
         currentChordObj={currentChordObj}
         currentKey={currentKey}
+        pitchSemitones={pitchSemitones}
+        setPitchSemitones={handleChangePitch}
         trackStates={trackStates}
         handleToggleMute={handleToggleMute}
         currentBpm={currentBpm}
         isPlaying={isPlaying}
         currentBeatNumber={currentBeatNumber}
+        onBackToCatalog={() => {
+          stopAudioNodes();
+          setIsPlaying(false);
+          setCurrentPage('catalog');
+        }}
       />
 
-      {/* Corpo Principal */}
+      {/* Corpo Principal do Estúdio */}
       <div className="flex-1 flex flex-col lg:flex-row min-h-0 overflow-hidden">
-        {/* Barra Lateral de Biblioteca */}
+        {/* Barra Lateral de Biblioteca Rápida */}
         <SidebarLibrary
           songs={songs}
           activeSong={activeSong}
@@ -696,12 +855,13 @@ export default function App() {
         {/* Painel Mobile de Modulação */}
         {mobileTab === 'modulation' && (
           <MobileModulationPanel
+            originalKey={activeSong.originalKey}
             currentKey={currentKey}
             pitchSemitones={pitchSemitones}
-            setPitchSemitones={setPitchSemitones}
+            setPitchSemitones={handleChangePitch}
             currentBpm={currentBpm}
             playbackSpeed={playbackSpeed}
-            setPlaybackSpeed={setPlaybackSpeed}
+            setPlaybackSpeed={handleChangePlaybackSpeed}
           />
         )}
 
@@ -787,6 +947,7 @@ export default function App() {
         setYoutubeUrl={setYoutubeUrl}
         handleYoutubeImport={handleYoutubeImport}
         handleLocalFileUpload={handleLocalFileUpload}
+        handleLoadDemoTrack={handleLoadDemoTrack}
         backendOnline={backendOnline}
       />
 

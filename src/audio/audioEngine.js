@@ -51,12 +51,15 @@ export function generatePreviewPeaksForSong(song) {
   };
 }
 
-export function synthesizeSongStems(ctx, song) {
+export function synthesizeSongStems(ctx, song, pitchSemitones = 0) {
   const sampleRate = ctx.sampleRate || 44100;
   const duration = song.duration;
   const totalSamples = Math.floor(sampleRate * duration);
   const beatDur = 60 / song.bpm;
   const barDur = beatDur * 4;
+
+  // Multiplicador exato de frequência para o tom selecionado: f = f0 * 2^(semitones / 12)
+  const pitchRatio = Math.pow(2, pitchSemitones / 12);
 
   const createBuf = () => ctx.createBuffer(2, totalSamples, sampleRate);
   const vocalsBuf = createBuf();
@@ -76,7 +79,7 @@ export function synthesizeSongStems(ctx, song) {
     return song.chords[idx] || song.chords[0];
   };
 
-  // 1. SÍNTESE DE VOCAL / MELODIA LEAD
+  // 1. SÍNTESE DE VOCAL / MELODIA LEAD NO TOM EXATO
   let vocalPhase = 0;
   const melodyPattern = [0, 2, 1, 3, 2, 1, 0, -1];
   const noteStep = beatDur * 0.5;
@@ -87,7 +90,7 @@ export function synthesizeSongStems(ctx, song) {
     const patVal = melodyPattern[stepIdx % melodyPattern.length];
     if (patVal >= 0) {
       const chord = getChordAtTime(t);
-      const baseFreq = (chord.freqs[patVal % chord.freqs.length] || 261.63) * 2;
+      const baseFreq = ((chord.freqs[patVal % chord.freqs.length] || 261.63) * 2) * pitchRatio;
       const vibrato = fastSin(2 * Math.PI * 5.5 * t) * 0.008;
       const freq = baseFreq * (1 + vibrato);
       vocalPhase += (2 * Math.PI * freq) / sampleRate;
@@ -103,7 +106,7 @@ export function synthesizeSongStems(ctx, song) {
     }
   }
 
-  // 2. SÍNTESE DE BATERIA (Bumbo, Caixa, Chimbal) + SMART METRÔNOMO
+  // 2. SÍNTESE DE BATERIA (Bumbo, Caixa, Chimbal) + SMART METRÔNOMO (Mantém punch rítmico nativo)
   const totalEighths = Math.floor(duration / (beatDur * 0.5));
   for (let e = 0; e < totalEighths; e++) {
     const startSample = Math.floor(e * beatDur * 0.5 * sampleRate);
@@ -162,7 +165,7 @@ export function synthesizeSongStems(ctx, song) {
     }
   }
 
-  // 3. SÍNTESE DE CONTRABAIXO + 4. HARMONIA
+  // 3. SÍNTESE DE CONTRABAIXO + 4. HARMONIA (Transpostos com perfeição matemática)
   let bassPhase = 0;
   for (let i = 0; i < totalSamples; i++) {
     const t = i / sampleRate;
@@ -170,7 +173,7 @@ export function synthesizeSongStems(ctx, song) {
     const localT = (t % (beatDur * 0.5)) / (beatDur * 0.5);
     const chord = getChordAtTime(t);
     const isFifth = eighthIdx % 4 === 3;
-    const rootFreq = (chord.freqs[isFifth ? 2 : 0] || 196.0) * 0.5;
+    const rootFreq = ((chord.freqs[isFifth ? 2 : 0] || 196.0) * 0.5) * pitchRatio;
     bassPhase += (2 * Math.PI * rootFreq) / sampleRate;
     const bEnv = (1 - localT * 0.75) * Math.min(1, localT * 35);
     const bSig = (fastSin(bassPhase) * 0.75 + fastSin(bassPhase * 2) * 0.25) * bEnv * 0.58;
@@ -179,10 +182,10 @@ export function synthesizeSongStems(ctx, song) {
 
     const beatLocal = (t % beatDur) / beatDur;
     const oEnv = (1 - beatLocal * 0.7) * Math.min(1, beatLocal * 40);
-    const f0 = chord.freqs[0] || 220;
-    const f1 = chord.freqs[1] || 261.63;
-    const f2 = chord.freqs[2] || 329.63;
-    const f3 = chord.freqs[3] || 392.0;
+    const f0 = (chord.freqs[0] || 220) * pitchRatio;
+    const f1 = (chord.freqs[1] || 261.63) * pitchRatio;
+    const f2 = (chord.freqs[2] || 329.63) * pitchRatio;
+    const f3 = (chord.freqs[3] || 392.0) * pitchRatio;
     const sL = fastSin(2 * Math.PI * f0 * t) + fastSin(2 * Math.PI * f2 * t);
     const sR = fastSin(2 * Math.PI * f1 * t) + fastSin(2 * Math.PI * f3 * t);
     oL[i] = (sL * 0.18 + sR * 0.06) * oEnv;
