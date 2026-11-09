@@ -1,4 +1,5 @@
 import React, { useRef, useState, useEffect } from 'react';
+import { Volume2, VolumeX } from 'lucide-react';
 import { StemIcon } from './StemIcon';
 
 export const StemWaveformRow = ({
@@ -70,12 +71,12 @@ export const StemWaveformRow = ({
 
     for (let i = 0; i < barCount; i++) {
       const x = i * (barWidth + barGap);
-      const amp = peaks[i] * Math.min(1.2, state.volume) * (isAudible ? 0.85 : 0.22);
+      const amp = peaks[i] * Math.min(1.2, state.volume) * (isAudible ? 0.85 : 0.18);
       const barH = Math.max(2, amp * (h * 0.78));
       const y = (h - barH) / 2;
 
       if (!isAudible) {
-        ctx.fillStyle = '#334155';
+        ctx.fillStyle = '#263042';
       } else if (x <= playX) {
         ctx.fillStyle = colorHex;
       } else {
@@ -100,37 +101,66 @@ export const StemWaveformRow = ({
   };
 
   return (
-    <div className="flex flex-row items-center flex-1 min-h-[54px] max-h-[84px] bg-[#121621] border border-slate-800/80 rounded-xl overflow-hidden hover:border-slate-700/80 transition-colors">
-      {/* Painel Compacto de Controles da Faixa */}
-      <div className="w-[180px] sm:w-64 md:w-80 shrink-0 h-full px-2.5 sm:px-3.5 bg-[#151A28] border-r border-slate-800/80 flex items-center justify-between gap-2 sm:gap-3">
-        {/* Ícone + Nome */}
-        <div className="flex items-center gap-2 sm:gap-2.5 min-w-0">
+    <div
+      className={`flex flex-row items-center flex-1 min-h-[54px] max-h-[84px] bg-[#121621] border rounded-xl overflow-hidden transition-colors ${
+        !isAudible
+          ? 'border-slate-800/50 opacity-75'
+          : state.solo
+          ? 'border-amber-500/60 shadow-sm shadow-amber-500/10'
+          : 'border-slate-800/80 hover:border-slate-700/80'
+      }`}
+    >
+      {/* Painel de Controles da Faixa */}
+      <div className="w-[205px] sm:w-68 md:w-80 shrink-0 h-full px-2 sm:px-3.5 bg-[#151A28] border-r border-slate-800/80 flex items-center justify-between gap-1.5 sm:gap-3">
+        {/* Botão de Ícone (Toque rápido também silencia/ativa a faixa estilo Moises AI) */}
+        <button
+          type="button"
+          onClick={() => onToggleMute(stemKey)}
+          title={isAudible ? `Silenciar ${label}` : `Ativar ${label}`}
+          className="flex items-center gap-1.5 sm:gap-2.5 min-w-0 text-left group cursor-pointer"
+        >
           <div
-            className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg flex items-center justify-center shrink-0"
-            style={{ backgroundColor: `${colorHex}20`, color: colorHex }}
+            className="relative w-7 h-7 sm:w-8 sm:h-8 rounded-lg flex items-center justify-center shrink-0 transition-transform active:scale-90"
+            style={{
+              backgroundColor: isAudible ? `${colorHex}25` : '#1e293b',
+              color: isAudible ? colorHex : '#64748b'
+            }}
           >
             <StemIcon type={stemKey} className="w-4 h-4 sm:w-4.5 sm:h-4.5" />
+            {!isAudible && (
+              <span className="absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 rounded-full bg-rose-600 text-white flex items-center justify-center">
+                <VolumeX className="w-2.5 h-2.5" />
+              </span>
+            )}
           </div>
           <div className="min-w-0">
-            <div className="text-xs sm:text-sm font-semibold text-slate-100 truncate leading-tight">
+            <div
+              className={`text-[11px] sm:text-sm font-semibold truncate leading-tight ${
+                isAudible ? 'text-slate-100' : 'text-slate-500 line-through'
+              }`}
+            >
               {label}
             </div>
-            <div className="text-[10px] text-slate-400 font-mono leading-tight">
-              {Math.round(state.volume * 100)}%
+            <div className="text-[10px] text-slate-400 font-mono leading-tight flex items-center gap-1">
+              {isAudible ? (
+                <span>{Math.round(state.volume * 100)}%</span>
+              ) : (
+                <span className="text-rose-400 font-bold">MUDO</span>
+              )}
             </div>
           </div>
-        </div>
+        </button>
 
         {/* Botões M/S + Volume + Pan */}
-        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+        <div className="flex items-center gap-1 sm:gap-2 shrink-0">
           <button
             type="button"
             onClick={() => onToggleMute(stemKey)}
-            title="Mutar faixa"
-            className={`w-6 h-6 sm:w-7 sm:h-7 rounded-md text-[10px] sm:text-xs font-bold transition-all flex items-center justify-center border ${
+            title={state.muted ? 'Desmutar faixa' : 'Mutar faixa'}
+            className={`w-7 h-7 rounded-lg text-[11px] sm:text-xs font-extrabold transition-all flex items-center justify-center border active:scale-90 ${
               state.muted
-                ? 'bg-rose-500/20 text-rose-400 border-rose-500/50'
-                : 'bg-slate-800/80 text-slate-400 border-slate-700 hover:text-slate-200'
+                ? 'bg-rose-600 text-white border-rose-400 shadow-md shadow-rose-600/30'
+                : 'bg-slate-800/90 text-slate-300 border-slate-700 hover:text-white'
             }`}
           >
             M
@@ -138,11 +168,11 @@ export const StemWaveformRow = ({
           <button
             type="button"
             onClick={() => onToggleSolo(stemKey)}
-            title="Solar faixa"
-            className={`w-6 h-6 sm:w-7 sm:h-7 rounded-md text-[10px] sm:text-xs font-bold transition-all flex items-center justify-center border ${
+            title={state.solo ? 'Desativar Solo' : 'Isolar faixa (Solo)'}
+            className={`w-7 h-7 rounded-lg text-[11px] sm:text-xs font-extrabold transition-all flex items-center justify-center border active:scale-90 ${
               state.solo
-                ? 'bg-amber-500/20 text-amber-300 border-amber-500/50'
-                : 'bg-slate-800/80 text-slate-400 border-slate-700 hover:text-slate-200'
+                ? 'bg-amber-400 text-slate-950 border-amber-300 shadow-md shadow-amber-400/30'
+                : 'bg-slate-800/90 text-slate-300 border-slate-700 hover:text-white'
             }`}
           >
             S
@@ -175,7 +205,7 @@ export const StemWaveformRow = ({
         </div>
       </div>
 
-      {/* Onda Sonora Fina */}
+      {/* Onda Sonora Interativa */}
       <div
         onClick={(e) => seekFromClientX(e.clientX, e.currentTarget)}
         onTouchStart={(e) => {

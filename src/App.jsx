@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { Check, Upload, AlertCircle } from 'lucide-react';
+import { Check, Upload, AlertCircle, VolumeX, Mic, Disc, RotateCcw } from 'lucide-react';
 import {
   PRESET_SONGS,
   STEM_CONFIG,
@@ -11,9 +11,9 @@ import {
 import {
   synthesizeSongStems,
   generatePreviewPeaksForSong,
-  extractPeaks
+  extractPeaks,
+  fastSin
 } from './audio/audioEngine';
-import { separateLocalAudioBufferClientSide } from './audio/dspSeparator';
 import {
   safeDecodeAudioData,
   fetchAndDecodeAudio,
@@ -25,7 +25,8 @@ import {
   saveTrackToDB,
   getAllTracksFromDB,
   deleteTrackFromDB,
-  inMemoryStemsCache
+  inMemoryStemsCache,
+  inMemoryRawBufferCache
 } from './audio/audioStorage';
 
 import { CatalogView } from './components/CatalogView';
@@ -97,7 +98,7 @@ export default function App() {
     metronome: { volume: 0.65, pan: 0, muted: true,  solo: false }
   });
 
-  // Referências para o motor Web Audio API
+  // Referências para o motor Web Audio API e sincronismo sem closures obsoletas
   const audioCtxRef = useRef(null);
   const stemsDataRef = useRef({});
   const synthesizedSongIdRef = useRef(null);
@@ -106,6 +107,20 @@ export default function App() {
   const playStartCtxTimeRef = useRef(0);
   const playStartOffsetRef = useRef(0);
   const rafRef = useRef(null);
+  const prevSongIdRef = useRef(null);
+
+  const trackStatesRef = useRef(trackStates);
+  trackStatesRef.current = trackStates;
+
+  const pitchSemitonesRef = useRef(pitchSemitones);
+  pitchSemitonesRef.current = pitchSemitones;
+
+  const playbackSpeedRef = useRef(playbackSpeed);
+  playbackSpeedRef.current = playbackSpeed;
+
+  const loopRangeRef = useRef(loopRange);
+  loopRangeRef.current = loopRange;
+
   const [peaksMap, setPeaksMap] = useState(() => generatePreviewPeaksForSong(PRESET_SONGS[0]));
 
   const showToast = useCallback((msg) => {
@@ -113,7 +128,7 @@ export default function App() {
     setTimeout(() => setToastMessage(null), 4000);
   }, []);
 
-  // Salva lista de músicas no localStorage
+  // Salva metadados das músicas no localStorage
   useEffect(() => {
     try {
       const serializable = songs.map((s) => ({
@@ -122,18 +137,21 @@ export default function App() {
         artist: s.artist,
         genre: s.genre,
         bpm: s.bpm,
+        firstBeatOffset: s.firstBeatOffset || 0,
+        beatTimes: s.beatTimes || null,
         originalKey: s.originalKey,
         duration: s.duration,
         thumbnail: s.thumbnail,
         coverGradient: s.coverGradient,
         sections: s.sections,
-        chords: s.chords
+        chords: s.chords,
+        peaks: s.peaks || null
       }));
       localStorage.setItem('davi_studio_songs_metadata', JSON.stringify(serializable));
     } catch (_) {}
   }, [songs]);
 
-  // Carrega faixas customizadas salvas do IndexedDB
+  // Carrega faixas customizadas salvas do IndexedDB ao abrir/voltar para a página
   useEffect(() => {
     (async () => {
       try {
@@ -141,9 +159,31 @@ export default function App() {
         if (storedTracks && storedTracks.length > 0) {
           setSongs((prev) => {
             const map = new Map(prev.map((s) => [s.id, s]));
-            storedTracks.forEach((t) => map.set(t.id, t));
+            storedTracks.forEach((t) => {
+              const existing = map.get(t.id);
+              map.set(t.id, {
+                ...existing,
+                ...t,
+                customStems: existing?.customStems || t.customStems || inMemoryStemsCache.get(t.id)
+              });
+            });
             return Array.from(map.values());
           });
+
+          // Pré-decodifica em background usando OfflineAudioContext para ficar pronto imediatamente
+          for (const track of storedTracks) {
+            if (!inMemoryStemsCache.has(track.id) && (track.audioArrayBuffer || track.audioBlob)) {
+              ensureSongStemsLoaded(null, track)
+                .then((stems) => {
+                  if (stems) {
+                    setSongs((prev) =>
+                      prev.map((s) => (s.id === track.id ? { ...s, customStems: stems } : s))
+                    );
+                  }
+                })
+                .catch(() => {});
+            }
+          }
         }
       } catch (_) {}
     })();
@@ -178,22 +218,39 @@ export default function App() {
     checkLocalBackend();
   }, [checkLocalBackend]);
 
-  const ensureAudioContext = useCallback(() => {
-    if (!audioCtxRef.current) {
-      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  /**
+   * Cria ou desbloqueia o AudioContext de forma SÍNCRONA dentro do clique/toque do usuário.
+   * Essencial para o iOS Safari quando o usuário sai da aba/app e volta.
+   */
+  const ensureAudioContext = useCallback((unlockWithSilentPulse = false) => {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
       audioCtxRef.current = new AudioContextClass();
     }
-    if (
-      audioCtxRef.current.state === 'suspended' ||
-      audioCtxRef.current.state === 'interrupted'
-    ) {
-      audioCtxRef.current.resume().catch(() => {});
+    const ctx = audioCtxRef.current;
+
+    if (ctx.state === 'suspended' || ctx.state === 'interrupted') {
+      ctx.resume().catch(() => {});
     }
-    return audioCtxRef.current;
+
+    if (unlockWithSilentPulse) {
+      try {
+        const silentBuf = ctx.createBuffer(1, 1, 22050);
+        const src = ctx.createBufferSource();
+        src.buffer = silentBuf;
+        src.connect(ctx.destination);
+        src.start(0);
+      } catch (_) {}
+    }
+
+    return ctx;
   }, []);
 
   const stopAudioNodes = useCallback(() => {
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    if (rafRef.current) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
     Object.values(activeNodesRef.current).forEach((nodeObj) => {
       try {
         nodeObj.source.stop();
@@ -203,25 +260,83 @@ export default function App() {
     activeNodesRef.current = {};
   }, []);
 
-  // Quando a música ativa mudar, reseta estados e carrega stems
+  // Quando o usuário sai da página/minimiza o navegador no celular e volta,
+  // evita estado zumbi pausando com segurança e reativando o contexto no retorno
   useEffect(() => {
-    stopAudioNodes();
-    setIsPlaying(false);
-    setCurrentTime(0);
-    setPitchSemitones(0);
-    setPlaybackSpeed(1.0);
-    setLoopRange({ enabled: false, start: 0, end: 8, label: '' });
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        if (rafRef.current) {
+          cancelAnimationFrame(rafRef.current);
+          rafRef.current = null;
+        }
+        Object.values(activeNodesRef.current).forEach((nodeObj) => {
+          try {
+            nodeObj.source.stop();
+            nodeObj.source.disconnect();
+          } catch (_) {}
+        });
+        activeNodesRef.current = {};
+        setIsPlaying(false);
+      } else if (document.visibilityState === 'visible') {
+        if (
+          audioCtxRef.current &&
+          (audioCtxRef.current.state === 'suspended' || audioCtxRef.current.state === 'interrupted')
+        ) {
+          audioCtxRef.current.resume().catch(() => {});
+        }
+      }
+    };
 
-    if (activeSong.customStems) {
-      stemsDataRef.current = activeSong.customStems;
+    const handleFirstTouchAfterReturn = () => {
+      if (
+        audioCtxRef.current &&
+        (audioCtxRef.current.state === 'suspended' || audioCtxRef.current.state === 'interrupted')
+      ) {
+        audioCtxRef.current.resume().catch(() => {});
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', handleVisibilityChange);
+    window.addEventListener('touchstart', handleFirstTouchAfterReturn, { passive: true });
+    window.addEventListener('click', handleFirstTouchAfterReturn, { passive: true });
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', handleVisibilityChange);
+      window.removeEventListener('touchstart', handleFirstTouchAfterReturn);
+      window.removeEventListener('click', handleFirstTouchAfterReturn);
+    };
+  }, []);
+
+  // Quando o ID da música ativa mudar, reseta controles e prepara stems/ondas
+  useEffect(() => {
+    const songChanged = prevSongIdRef.current !== activeSong.id;
+    prevSongIdRef.current = activeSong.id;
+
+    if (songChanged) {
+      stopAudioNodes();
+      setIsPlaying(false);
+      setCurrentTime(0);
+      setPitchSemitones(0);
+      setPlaybackSpeed(1.0);
+      setLoopRange({ enabled: false, start: 0, end: 8, label: '' });
+    }
+
+    const cachedStems = activeSong.customStems || inMemoryStemsCache.get(activeSong.id);
+    if (cachedStems) {
+      stemsDataRef.current = cachedStems;
       synthesizedSongIdRef.current = activeSong.id;
-      synthesizedPitchRef.current = 0;
       const customPeaks = {};
-      Object.keys(activeSong.customStems).forEach((k) => {
-        customPeaks[k] = activeSong.customStems[k].peaks;
+      Object.keys(cachedStems).forEach((k) => {
+        if (cachedStems[k]?.peaks) {
+          customPeaks[k] = cachedStems[k].peaks;
+        }
       });
       setPeaksMap(customPeaks);
-    } else {
+    } else if (activeSong.peaks) {
+      setPeaksMap(activeSong.peaks);
+    } else if (songChanged) {
       stemsDataRef.current = {};
       synthesizedSongIdRef.current = null;
       synthesizedPitchRef.current = 0;
@@ -229,61 +344,78 @@ export default function App() {
     }
   }, [activeSong, stopAudioNodes]);
 
-  // Atualização em tempo real de volume e pan dos nós de áudio
+  // Atualização IMEDIATA (0ms de latência) de Mute, Solo, Volume e Pan nos nós de áudio ativos
   useEffect(() => {
-    if (!audioCtxRef.current) return;
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
     const anySolo = Object.values(trackStates).some((t) => t.solo);
-    const now = audioCtxRef.current.currentTime;
+    const now = ctx.currentTime;
 
     Object.keys(trackStates).forEach((key) => {
       const st = trackStates[key];
       const nodeObj = activeNodesRef.current[key];
-      if (!nodeObj) return;
+      if (!nodeObj || !nodeObj.gainNode) return;
+
       const isAudible = anySolo ? st.solo : !st.muted;
       const targetGain = isAudible ? st.volume : 0;
+
       try {
-        nodeObj.gainNode.gain.setTargetAtTime(targetGain, now, 0.015);
+        nodeObj.gainNode.gain.cancelScheduledValues(now);
+        nodeObj.gainNode.gain.setValueAtTime(targetGain, now);
+        nodeObj.gainNode.gain.value = targetGain;
+
         if (nodeObj.panNode) {
-          nodeObj.panNode.pan.setTargetAtTime(st.pan, now, 0.015);
+          nodeObj.panNode.pan.cancelScheduledValues(now);
+          nodeObj.panNode.pan.setValueAtTime(st.pan, now);
+          nodeObj.panNode.pan.value = st.pan;
         }
       } catch (_) {}
     });
   }, [trackStates]);
 
-  // Início da reprodução sincronizada com afinação limpa de estúdio
+  // Início da reprodução sincronizada
   const startPlaybackAt = useCallback(
-    async (offsetSeconds) => {
-      const ctx = ensureAudioContext();
-      if (ctx.state === 'suspended') {
+    async (offsetSeconds, targetSongOverride = null) => {
+      const songToPlay = targetSongOverride || activeSong;
+      const ctx = ensureAudioContext(true);
+
+      if (ctx.state === 'suspended' || ctx.state === 'interrupted') {
         try {
           await ctx.resume();
         } catch (_) {}
       }
 
       const isCustomSong = Boolean(
-        activeSong.customStems ||
-        activeSong.audioBlob ||
-        inMemoryStemsCache.has(activeSong.id) ||
-        activeSong.id.startsWith('local-') ||
-        activeSong.id.startsWith('yt-')
+        songToPlay.customStems ||
+          songToPlay.audioArrayBuffer ||
+          songToPlay.audioBlob ||
+          inMemoryStemsCache.has(songToPlay.id) ||
+          inMemoryRawBufferCache.has(songToPlay.id) ||
+          songToPlay.id.startsWith('local-')
       );
 
+      const currentPitch = pitchSemitonesRef.current;
+
       const needsRegen =
-        !stemsDataRef.current?.vocals ||
-        synthesizedSongIdRef.current !== activeSong.id ||
-        (!isCustomSong && synthesizedPitchRef.current !== pitchSemitones);
+        !stemsDataRef.current?.vocals?.buffer ||
+        synthesizedSongIdRef.current !== songToPlay.id ||
+        (!isCustomSong && synthesizedPitchRef.current !== currentPitch);
 
       if (needsRegen) {
         if (isCustomSong) {
-          const loadedStems = await ensureSongStemsLoaded(ctx, activeSong);
+          const loadedStems = await ensureSongStemsLoaded(ctx, songToPlay);
           if (loadedStems) {
             stemsDataRef.current = loadedStems;
+          } else {
+            showToast('Arquivo de áudio original não encontrado. Faça o upload novamente.');
+            return;
           }
         } else {
-          stemsDataRef.current = synthesizeSongStems(ctx, activeSong, pitchSemitones);
+          stemsDataRef.current = synthesizeSongStems(ctx, songToPlay, currentPitch);
         }
-        synthesizedSongIdRef.current = activeSong.id;
-        synthesizedPitchRef.current = pitchSemitones;
+
+        synthesizedSongIdRef.current = songToPlay.id;
+        synthesizedPitchRef.current = currentPitch;
 
         const realPeaks = {};
         if (stemsDataRef.current) {
@@ -296,38 +428,48 @@ export default function App() {
         }
       }
 
+      // Garante que após qualquer await o contexto de áudio do iOS continue em 'running'
+      if (ctx.state === 'suspended' || ctx.state === 'interrupted') {
+        try {
+          await ctx.resume();
+        } catch (_) {}
+      }
+
       stopAudioNodes();
 
-      const clampedOffset = Math.max(
-        0,
-        Math.min((activeSong.duration || 32) - 0.05, offsetSeconds)
-      );
-      const anySolo = Object.values(trackStates).some((t) => t.solo);
-      const syncStartTime = ctx.currentTime + 0.015;
+      const duration = songToPlay.duration || 32;
+      const clampedOffset = Math.max(0, Math.min(duration - 0.05, offsetSeconds));
+      const currentTracks = trackStatesRef.current;
+      const anySolo = Object.values(currentTracks).some((t) => t.solo);
+      const speed = playbackSpeedRef.current;
+      const syncStartTime = ctx.currentTime + 0.02;
 
-      Object.keys(trackStates).forEach((key) => {
+      Object.keys(currentTracks).forEach((key) => {
         const stemObj = stemsDataRef.current?.[key];
         if (!stemObj?.buffer) return;
 
         const source = ctx.createBufferSource();
         source.buffer = stemObj.buffer;
-        source.playbackRate.value = playbackSpeed;
+        source.playbackRate.value = speed;
 
-        // Para faixas com áudio real, aplica detune nativo limpo do Web Audio
+        // Para faixas com áudio real, aplica detune nos canais tonais (Vocais, Baixo, Harmonia)
         if (isCustomSong && (key === 'vocals' || key === 'bass' || key === 'other')) {
           if (source.detune) {
-            source.detune.value = pitchSemitones * 100;
+            source.detune.value = currentPitch * 100;
           }
         }
 
         const gainNode = ctx.createGain();
-        const st = trackStates[key];
+        const st = currentTracks[key];
         const isAudible = anySolo ? st.solo : !st.muted;
-        gainNode.gain.value = isAudible ? st.volume : 0;
+        const targetGain = isAudible ? st.volume : 0;
+        gainNode.gain.setValueAtTime(targetGain, ctx.currentTime);
+        gainNode.gain.value = targetGain;
 
         const panNode =
           typeof ctx.createStereoPanner === 'function' ? ctx.createStereoPanner() : null;
         if (panNode) {
+          panNode.pan.setValueAtTime(st.pan, ctx.currentTime);
           panNode.pan.value = st.pan;
           source.connect(gainNode);
           gainNode.connect(panNode);
@@ -338,7 +480,7 @@ export default function App() {
         }
 
         source.start(syncStartTime, clampedOffset);
-        activeNodesRef.current[key] = { source, gainNode, panNode };
+        activeNodesRef.current[key] = { source, gainNode, panNode, isCustomSong };
       });
 
       playStartCtxTimeRef.current = syncStartTime;
@@ -349,15 +491,16 @@ export default function App() {
       const updateLoop = () => {
         if (!audioCtxRef.current) return;
         const rawElapsed = audioCtxRef.current.currentTime - playStartCtxTimeRef.current;
-        const elapsed = Math.max(0, rawElapsed) * playbackSpeed;
+        const elapsed = Math.max(0, rawElapsed) * playbackSpeedRef.current;
         const nextTime = playStartOffsetRef.current + elapsed;
+        const activeLoop = loopRangeRef.current;
 
-        if (loopRange.enabled && nextTime >= loopRange.end) {
-          startPlaybackAt(loopRange.start);
+        if (activeLoop.enabled && nextTime >= activeLoop.end) {
+          startPlaybackAt(activeLoop.start, songToPlay);
           return;
         }
 
-        if (nextTime >= (activeSong.duration || 32)) {
+        if (nextTime >= duration) {
           stopAudioNodes();
           setIsPlaying(false);
           setCurrentTime(0);
@@ -370,11 +513,12 @@ export default function App() {
 
       rafRef.current = requestAnimationFrame(updateLoop);
     },
-    [activeSong, ensureAudioContext, loopRange, playbackSpeed, pitchSemitones, stopAudioNodes, trackStates]
+    [activeSong, ensureAudioContext, showToast, stopAudioNodes]
   );
 
   const togglePlay = () => {
-    const ctx = ensureAudioContext();
+    // Desbloqueia o AudioContext de forma síncrona no clique antes de qualquer chamada assíncrona
+    const ctx = ensureAudioContext(true);
     if (isPlaying) {
       stopAudioNodes();
       setIsPlaying(false);
@@ -382,7 +526,7 @@ export default function App() {
     }
 
     if (countInBars > 0 && currentTime < 0.2) {
-      const beatSec = 60 / (activeSong.bpm * playbackSpeed);
+      const beatSec = 60 / ((activeSong.bpm || 120) * playbackSpeed);
       setCountInRemaining(4);
       for (let b = 0; b < 4; b++) {
         setTimeout(() => {
@@ -408,6 +552,7 @@ export default function App() {
   };
 
   const handleSeek = (newTime) => {
+    ensureAudioContext(true);
     const clamped = Math.max(0, Math.min((activeSong.duration || 32) - 0.1, newTime));
     setCurrentTime(clamped);
     if (isPlaying) {
@@ -415,44 +560,144 @@ export default function App() {
     }
   };
 
-  // Alteração de Tom: Se estiver tocando, reaplica no tom exato imediatamente
+  // Alteração de Tom em tempo real (sem interromper o áudio se for música customizada)
   const handleChangePitch = (newSemitones) => {
     setPitchSemitones(newSemitones);
+    pitchSemitonesRef.current = newSemitones;
+
     if (isPlaying) {
-      startPlaybackAt(currentTime);
+      const hasCustomNodes = Object.values(activeNodesRef.current).some((n) => n?.isCustomSong);
+      if (hasCustomNodes && audioCtxRef.current) {
+        const now = audioCtxRef.current.currentTime;
+        ['vocals', 'bass', 'other'].forEach((key) => {
+          const nodeObj = activeNodesRef.current[key];
+          if (nodeObj?.source?.detune) {
+            try {
+              nodeObj.source.detune.setValueAtTime(newSemitones * 100, now);
+              nodeObj.source.detune.value = newSemitones * 100;
+            } catch (_) {}
+          }
+        });
+      } else {
+        startPlaybackAt(currentTime);
+      }
     }
   };
 
-  // Alteração de Velocidade: Atualiza os osciladores ou buffers
+  // Alteração de Velocidade sem perder a posição atual da música
   const handleChangePlaybackSpeed = (newSpeed) => {
+    if (audioCtxRef.current && isPlaying) {
+      const rawElapsed = audioCtxRef.current.currentTime - playStartCtxTimeRef.current;
+      const currentExactPos = playStartOffsetRef.current + Math.max(0, rawElapsed) * playbackSpeedRef.current;
+      playStartOffsetRef.current = currentExactPos;
+      playStartCtxTimeRef.current = audioCtxRef.current.currentTime;
+    }
+
     setPlaybackSpeed(newSpeed);
+    playbackSpeedRef.current = newSpeed;
+
     Object.values(activeNodesRef.current).forEach((nodeObj) => {
-      if (nodeObj?.source) {
+      if (nodeObj?.source && audioCtxRef.current) {
         try {
           nodeObj.source.playbackRate.setValueAtTime(newSpeed, audioCtxRef.current.currentTime);
+          nodeObj.source.playbackRate.value = newSpeed;
         } catch (_) {}
       }
     });
   };
 
-  const handleToggleMute = (key) => {
+  // Ressincroniza a Batida 1 do Smart Metrônomo exatamente no segundo atual (caso o usuário queira ajustar o clique na mão)
+  const handleSyncMetronomeHere = () => {
+    const ctx = ensureAudioContext(true);
+    const beatSec = 60 / (activeSong.bpm || 120);
+    const newOffset = currentTime % beatSec;
+    const duration = activeSong.duration || 32;
+    const sr = ctx.sampleRate || 44100;
+    const len = Math.floor(duration * sr);
+    const metroBuf = ctx.createBuffer(2, len, sr);
+    const mL = metroBuf.getChannelData(0);
+    const mR = metroBuf.getChannelData(1);
+
+    const newBeatTimes = [];
+    for (let b = 0; ; b++) {
+      const t = newOffset + b * beatSec;
+      if (t >= duration) break;
+      newBeatTimes.push(t);
+    }
+
+    // Marca como tempo 1 a batida mais próxima do currentTime
+    const currentBeatIdx = Math.round((currentTime - newOffset) / beatSec);
+
+    for (let b = 0; b < newBeatTimes.length; b++) {
+      const start = Math.floor(newBeatTimes[b] * sr);
+      if (start >= len) break;
+      const isDownbeat = ((b - currentBeatIdx) % 4 + 4000) % 4 === 0;
+      const freq = isDownbeat ? 1480 : 987.77;
+      const clickLen = Math.min(Math.floor(0.045 * sr), len - start);
+      for (let k = 0; k < clickLen; k++) {
+        const kt = k / sr;
+        const val =
+          fastSin(2 * Math.PI * freq * kt) *
+          Math.exp(-kt * 85) *
+          (isDownbeat ? 0.75 : 0.52);
+        mL[start + k] = val;
+        mR[start + k] = val;
+      }
+    }
+
+    const newMetroStem = { buffer: metroBuf, peaks: extractPeaks(metroBuf) };
+    if (stemsDataRef.current) {
+      stemsDataRef.current = {
+        ...stemsDataRef.current,
+        metronome: newMetroStem
+      };
+      inMemoryStemsCache.set(activeSong.id, stemsDataRef.current);
+    }
+
     setTrackStates((prev) => ({
       ...prev,
-      [key]: { ...prev[key], muted: !prev[key].muted }
+      metronome: { ...prev.metronome, muted: false }
     }));
+
+    if (isPlaying) {
+      startPlaybackAt(currentTime);
+    }
+    showToast('Metrônomo alinhado com o tempo atual!');
+  };
+
+  const handleToggleMute = (key) => {
+    setTrackStates((prev) => {
+      const nextMuted = !prev[key].muted;
+      return {
+        ...prev,
+        [key]: {
+          ...prev[key],
+          muted: nextMuted,
+          // Se o usuário mutar uma faixa que estava em Solo, desativa o Solo dela
+          solo: nextMuted ? false : prev[key].solo
+        }
+      };
+    });
   };
 
   const handleToggleSolo = (key) => {
-    setTrackStates((prev) => ({
-      ...prev,
-      [key]: { ...prev[key], solo: !prev[key].solo }
-    }));
+    setTrackStates((prev) => {
+      const nextSolo = !prev[key].solo;
+      return {
+        ...prev,
+        [key]: {
+          ...prev[key],
+          solo: nextSolo,
+          muted: nextSolo ? false : prev[key].muted
+        }
+      };
+    });
   };
 
   const handleChangeVolume = (key, val) => {
     setTrackStates((prev) => ({
       ...prev,
-      [key]: { ...prev[key], volume: val, muted: val === 0 ? true : prev[key].muted }
+      [key]: { ...prev[key], volume: val, muted: val === 0 ? true : false }
     }));
   };
 
@@ -472,17 +717,30 @@ export default function App() {
         other:     { ...prev.other,     muted: false, solo: false, volume: 1.0 },
         metronome: { ...prev.metronome, solo: false }
       };
-      if (presetType === 'no-vocals') base.vocals.muted = true;
-      if (presetType === 'no-drums') base.drums.muted = true;
-      if (presetType === 'no-bass') base.bass.muted = true;
-      if (presetType === 'no-guitar') base.other.muted = true;
+      if (presetType === 'no-vocals') {
+        base.vocals.muted = true;
+        showToast('Modo Karaokê: Voz Removida!');
+      } else if (presetType === 'only-vocals') {
+        base.vocals.solo = true;
+        showToast('Voz Isolada (Solo Vocal)!');
+      } else if (presetType === 'no-drums') {
+        base.drums.muted = true;
+        showToast('Bateria silenciada!');
+      } else if (presetType === 'no-bass') {
+        base.bass.muted = true;
+        showToast('Contrabaixo silenciado!');
+      } else if (presetType === 'no-guitar') {
+        base.other.muted = true;
+        showToast('Harmonia / Violão silenciado!');
+      } else {
+        showToast('Mixagem original (todas as faixas ativas)!');
+      }
       return base;
     });
-    showToast('Preset de mixagem aplicado');
   };
 
   const handleExportWav = () => {
-    const ctx = ensureAudioContext();
+    const ctx = ensureAudioContext(true);
     if (!stemsDataRef.current?.vocals) {
       stemsDataRef.current = activeSong.customStems
         ? activeSong.customStems
@@ -501,7 +759,7 @@ export default function App() {
     showToast('Mixagem exportada em .WAV');
   };
 
-  // Upload Local com Separação DSP Client-side Real e Detecção de Tonalidade (Salva no IndexedDB)
+  // Upload Local com Separação DSP de 4ª Ordem e Detecção de Acordes Reais por Tempo
   const handleLocalFileUpload = async (e, targetSongId = null) => {
     let file = null;
     if (e.target?.files?.length > 0) {
@@ -522,15 +780,18 @@ export default function App() {
       setProcessingStep('2/4 • Decodificando áudio no navegador...');
       await new Promise((r) => setTimeout(r, 40));
       const arrayBuf = await file.arrayBuffer();
-      const rawBlob = new Blob([arrayBuf], { type: file.type || 'audio/mpeg' });
+      const rawArrayBuffer = arrayBuf.slice(0);
+      const rawBlob = new Blob([rawArrayBuffer], { type: file.type || 'audio/mpeg' });
       const decoded = await safeDecodeAudioData(ctx, arrayBuf);
 
-      setProcessingStep('3/4 • Separando 4 stems e detectando tom real...');
+      setProcessingStep('3/4 • Isolando 4 stems, sincronizando BPM e cifras...');
       await new Promise((r) => setTimeout(r, 40));
       const existing = targetSongId ? songs.find((s) => s.id === targetSongId) : null;
       const songId = targetSongId || `local-${Date.now()}`;
       const songTitle = existing ? existing.title : file.name.replace(/\.[^/.]+$/, '');
-      const songArtist = existing ? existing.artist : `Arquivo Local • ${(file.size / (1024 * 1024)).toFixed(1)} MB`;
+      const songArtist = existing
+        ? existing.artist
+        : `Arquivo Local • ${(file.size / (1024 * 1024)).toFixed(1)} MB`;
 
       const newSong = await processAudioBufferIntoSong(
         ctx,
@@ -542,31 +803,30 @@ export default function App() {
           thumbnail: existing?.thumbnail || null,
           coverGradient: existing?.coverGradient || 'from-cyan-600 via-teal-700 to-slate-900'
         },
-        rawBlob
+        rawBlob,
+        rawArrayBuffer
       );
 
       setProcessingStep('4/4 • Salvando na biblioteca...');
       await new Promise((r) => setTimeout(r, 40));
 
-      // Atualiza lista de músicas
       setSongs((prev) => {
         const withoutOld = prev.filter((s) => s.id !== songId);
         return [newSong, ...withoutOld];
       });
 
-      // Salva no IndexedDB com audioBlob
       await saveTrackToDB(newSong);
 
-      // Armazena no cache de stems
       stemsDataRef.current = newSong.customStems;
       synthesizedSongIdRef.current = newSong.id;
+      prevSongIdRef.current = newSong.id;
       setPeaksMap(newSong.peaks);
 
       setActiveSongId(newSong.id);
       setShowImportModal(false);
       setCurrentPage('studio');
       setMobileTab('mixer');
-      showToast(`Áudio de "${newSong.title}" (Tom ${newSong.originalKey}) pronto no estúdio!`);
+      showToast(`"${newSong.title}" (${newSong.originalKey} • ${newSong.bpm} BPM) pronta!`);
     } catch (err) {
       console.error('Erro no upload local:', err);
       showToast(err.message || 'Erro ao decodificar arquivo de áudio');
@@ -577,7 +837,7 @@ export default function App() {
     }
   };
 
-  // Importação direta de áudio por URL (MP3/WAV da Web ou download do Y2Mate)
+  // Importação direta de áudio por URL
   const handleAudioUrlImport = async (audioUrl) => {
     setIsProcessingImport(true);
     setProcessingStep('1/3 • Baixando áudio da URL...');
@@ -586,11 +846,11 @@ export default function App() {
     try {
       const ctx = ensureAudioContext();
 
-      const { decoded, audioBlob } = await fetchAndDecodeAudio(ctx, audioUrl);
+      const { decoded, audioBlob, audioArrayBuffer } = await fetchAndDecodeAudio(ctx, audioUrl);
       const urlFileName = audioUrl.split('/').pop().split('?')[0] || 'Áudio Remoto';
       const cleanTitle = decodeURIComponent(urlFileName).replace(/\.[^/.]+$/, '');
 
-      setProcessingStep('2/3 • Separando stems e detectando tom real...');
+      setProcessingStep('2/3 • Isolando stems e detectando acordes reais...');
       await new Promise((r) => setTimeout(r, 40));
       const newSong = await processAudioBufferIntoSong(
         ctx,
@@ -599,7 +859,8 @@ export default function App() {
           title: cleanTitle || 'Música Remota',
           artist: 'Link da Web • Áudio Real'
         },
-        audioBlob
+        audioBlob,
+        audioArrayBuffer
       );
 
       setProcessingStep('3/3 • Salvando na biblioteca...');
@@ -610,13 +871,14 @@ export default function App() {
 
       stemsDataRef.current = newSong.customStems;
       synthesizedSongIdRef.current = newSong.id;
+      prevSongIdRef.current = newSong.id;
       setPeaksMap(newSong.peaks);
 
       setActiveSongId(newSong.id);
       setShowImportModal(false);
       setCurrentPage('studio');
       setMobileTab('mixer');
-      showToast(`Áudio real de "${newSong.title}" (Tom ${newSong.originalKey}) pronto!`);
+      showToast(`Áudio de "${newSong.title}" (${newSong.originalKey}) pronto!`);
     } catch (err) {
       console.error('Erro no download por URL:', err);
       showToast(err.message || 'Erro ao baixar arquivo de áudio da URL');
@@ -627,7 +889,7 @@ export default function App() {
     }
   };
 
-  // Upload de arquivo MP3 do YouTube (vincula metadados do vídeo ao áudio real baixado)
+  // Upload de arquivo MP3 do YouTube
   const handleYoutubeDirectMp3Upload = async (e, ytPreview) => {
     let file = null;
     if (e.target?.files?.length > 0) {
@@ -648,13 +910,14 @@ export default function App() {
       setProcessingStep('2/3 • Decodificando áudio...');
       await new Promise((r) => setTimeout(r, 40));
       const arrayBuf = await file.arrayBuffer();
-      const rawBlob = new Blob([arrayBuf], { type: file.type || 'audio/mpeg' });
+      const rawArrayBuffer = arrayBuf.slice(0);
+      const rawBlob = new Blob([rawArrayBuffer], { type: file.type || 'audio/mpeg' });
       const decoded = await safeDecodeAudioData(ctx, arrayBuf);
 
-      const songId = `yt-${ytPreview?.id || Date.now()}`;
+      const songId = `local-yt-${ytPreview?.id || Date.now()}`;
       const songTitle = file.name.replace(/\.[^/.]+$/, '');
 
-      setProcessingStep('3/3 • Separando faixas e detectando tom da música...');
+      setProcessingStep('3/3 • Separando faixas e detectando cifras da música...');
       await new Promise((r) => setTimeout(r, 40));
       const newSong = await processAudioBufferIntoSong(
         ctx,
@@ -666,7 +929,8 @@ export default function App() {
           thumbnail: ytPreview?.thumbnail || null,
           coverGradient: 'from-rose-600 via-red-800 to-stone-900'
         },
-        rawBlob
+        rawBlob,
+        rawArrayBuffer
       );
 
       setSongs((prev) => [newSong, ...prev.filter((s) => s.id !== songId)]);
@@ -674,13 +938,14 @@ export default function App() {
 
       stemsDataRef.current = newSong.customStems;
       synthesizedSongIdRef.current = newSong.id;
+      prevSongIdRef.current = newSong.id;
       setPeaksMap(newSong.peaks);
 
       setActiveSongId(newSong.id);
       setShowImportModal(false);
       setCurrentPage('studio');
       setMobileTab('mixer');
-      showToast(`Música "${newSong.title}" (Tom ${newSong.originalKey}) pronta no estúdio!`);
+      showToast(`Música "${newSong.title}" (${newSong.originalKey}) pronta no estúdio!`);
     } catch (err) {
       console.error('Erro ao processar MP3:', err);
       showToast(err.message || 'Erro ao processar arquivo MP3');
@@ -710,7 +975,9 @@ export default function App() {
     let videoThumbnail = `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg`;
 
     try {
-      const oembedRes = await fetch(`https://noembed.com/embed?url=https://www.youtube.com/watch?v=${ytId}`);
+      const oembedRes = await fetch(
+        `https://noembed.com/embed?url=https://www.youtube.com/watch?v=${ytId}`
+      );
       if (oembedRes.ok) {
         const oembedData = await oembedRes.json();
         if (oembedData.title) videoTitle = oembedData.title;
@@ -719,7 +986,6 @@ export default function App() {
       }
     } catch (_) {}
 
-    // Configura o Job visual no Catálogo
     const tempJob = {
       title: videoTitle,
       stepMessage: 'Iniciando extração de áudio e separação...',
@@ -728,7 +994,6 @@ export default function App() {
     setProcessingJob(tempJob);
     setShowImportModal(false);
 
-    // Se o backend Python local ou túnel Colab estiver rodando (Demucs v4 real)
     const isServerUp = await checkLocalBackend();
     if (isServerUp) {
       try {
@@ -757,7 +1022,7 @@ export default function App() {
         for (const key of ['vocals', 'drums', 'bass', 'other']) {
           const wavRes = await fetch(data.stemUrls[key]);
           const arr = await wavRes.arrayBuffer();
-          const buf = await ctx.decodeAudioData(arr);
+          const buf = await safeDecodeAudioData(ctx, arr);
           loadedStems[key] = { buffer: buf, peaks: extractPeaks(buf) };
         }
         const tempSong = {
@@ -768,7 +1033,7 @@ export default function App() {
         loadedStems.metronome = synthesizeSongStems(ctx, tempSong, 0).metronome;
 
         const newSong = {
-          id: data.id || `yt-${ytId}`,
+          id: data.id || `local-yt-${ytId}`,
           title: videoTitle,
           artist: `${videoAuthor} • Demucs v4 Neural`,
           bpm: data.bpm || 120,
@@ -794,7 +1059,7 @@ export default function App() {
         };
 
         setSongs((prev) => [newSong, ...prev]);
-        saveTrackToDB(newSong);
+        await saveTrackToDB(newSong);
         setActiveSongId(newSong.id);
         setProcessingJob(null);
         setIsProcessingImport(false);
@@ -806,7 +1071,6 @@ export default function App() {
       }
     }
 
-    // Modo Standalone Web: Pipeline com progresso animado no catálogo
     const pipelineSteps = [
       { msg: '1/4 • Identificando vídeo e metadados no YouTube...', pct: 30 },
       { msg: '2/4 • Mapeando tonalidade e progressão de acordes...', pct: 60 },
@@ -850,7 +1114,7 @@ export default function App() {
     };
 
     setSongs((prev) => [newSong, ...prev]);
-    saveTrackToDB(newSong);
+    await saveTrackToDB(newSong);
     setActiveSongId(newSong.id);
     setProcessingJob(null);
     setIsProcessingImport(false);
@@ -866,6 +1130,8 @@ export default function App() {
   };
 
   const handleDeleteSong = async (idToDelete) => {
+    stopAudioNodes();
+    setIsPlaying(false);
     setSongs((prev) => prev.filter((s) => s.id !== idToDelete));
     await deleteTrackFromDB(idToDelete);
     if (activeSongId === idToDelete) {
@@ -875,16 +1141,15 @@ export default function App() {
   };
 
   const handleResetCatalog = () => {
+    stopAudioNodes();
+    setIsPlaying(false);
     setSongs(PRESET_SONGS);
     localStorage.removeItem('davi_studio_songs_metadata');
     showToast('Catálogo original restaurado!');
   };
 
   const handleToggleCatalogPreview = async (song) => {
-    const ctx = ensureAudioContext();
-    if (ctx.state === 'suspended') {
-      await ctx.resume().catch(() => {});
-    }
+    ensureAudioContext(true);
 
     if (isPlaying && activeSongId === song.id) {
       stopAudioNodes();
@@ -893,8 +1158,9 @@ export default function App() {
     }
 
     stopAudioNodes();
+    prevSongIdRef.current = song.id;
     setActiveSongId(song.id);
-    await startPlaybackAt(0);
+    await startPlaybackAt(0, song);
   };
 
   const currentKey = useMemo(
@@ -917,19 +1183,38 @@ export default function App() {
   );
 
   const activeChordIndex = useMemo(() => {
+    if (!transposedChords || transposedChords.length === 0) return 0;
     const idx = transposedChords.findIndex(
       (c) => currentTime >= c.time && currentTime < c.time + c.duration
     );
-    return idx === -1 ? 0 : idx;
+    if (idx !== -1) return idx;
+    // Se passou do último acorde mas a música continua, mantém no último
+    if (currentTime >= transposedChords[transposedChords.length - 1].time) {
+      return transposedChords.length - 1;
+    }
+    return 0;
   }, [transposedChords, currentTime]);
 
   const currentChordObj = transposedChords[activeChordIndex] || { transposed: 'N.C.' };
   const nextChordObj = transposedChords[activeChordIndex + 1] || { transposed: 'Fim' };
 
+  // Contador visual de batidas [1, 2, 3, 4] sincronizado com a grade de batidas real e firstBeatOffset
   const currentBeatNumber = useMemo(() => {
+    if (Array.isArray(activeSong.beatTimes) && activeSong.beatTimes.length > 0) {
+      let beatIdx = 0;
+      for (let i = 0; i < activeSong.beatTimes.length; i++) {
+        if (currentTime >= activeSong.beatTimes[i]) {
+          beatIdx = i;
+        } else {
+          break;
+        }
+      }
+      return (beatIdx % 4) + 1;
+    }
     const beatDur = 60 / (activeSong.bpm || 120);
-    return (Math.floor(currentTime / beatDur) % 4) + 1;
-  }, [currentTime, activeSong.bpm]);
+    const adjustedTime = Math.max(0, currentTime - (activeSong.firstBeatOffset || 0));
+    return (Math.floor(adjustedTime / beatDur) % 4) + 1;
+  }, [currentTime, activeSong.bpm, activeSong.firstBeatOffset, activeSong.beatTimes]);
 
   const anySoloActive = useMemo(
     () => Object.values(trackStates).some((t) => t.solo),
@@ -947,7 +1232,6 @@ export default function App() {
   if (currentPage === 'catalog') {
     return (
       <>
-        {/* Notificação Flutuante Toast */}
         {toastMessage && (
           <div className="fixed top-16 right-4 z-50 flex items-center gap-2 bg-slate-900/95 border border-emerald-500/50 text-slate-100 px-3.5 py-2.5 rounded-xl shadow-2xl animate-bounce">
             <Check className="w-4 h-4 text-emerald-400 shrink-0" />
@@ -960,7 +1244,9 @@ export default function App() {
           previewingId={isPlaying ? activeSongId : null}
           onTogglePreview={handleToggleCatalogPreview}
           onOpenSongInStudio={(id) => {
+            ensureAudioContext(true);
             stopAudioNodes();
+            setIsPlaying(false);
             setActiveSongId(id);
             setCurrentPage('studio');
           }}
@@ -972,7 +1258,6 @@ export default function App() {
           onResetCatalog={handleResetCatalog}
         />
 
-        {/* Modal 1: Importar Música */}
         <ImportModal
           showImportModal={showImportModal}
           setShowImportModal={setShowImportModal}
@@ -982,20 +1267,39 @@ export default function App() {
           setYoutubeUrl={setYoutubeUrl}
           handleYoutubeImport={handleYoutubeImport}
           handleLocalFileUpload={handleLocalFileUpload}
+          handleAudioUrlImport={handleAudioUrlImport}
+          handleYoutubeDirectMp3Upload={handleYoutubeDirectMp3Upload}
           handleLoadDemoTrack={handleLoadDemoTrack}
           backendOnline={backendOnline}
+          onOpenBackendModal={() => setShowBackendModal(true)}
         />
 
-        {/* Modal 2: Servidor Python Local Demucs */}
         <BackendModal
           showBackendModal={showBackendModal}
           setShowBackendModal={setShowBackendModal}
           backendOnline={backendOnline}
           checkLocalBackend={checkLocalBackend}
+          backendUrl={backendUrl}
+          setBackendUrl={setBackendUrl}
         />
       </>
     );
   }
+
+  // Verifica qual preset rápido está ativo para destacar visualmente
+  const isKaraokeActive =
+    trackStates.vocals.muted &&
+    !trackStates.drums.muted &&
+    !trackStates.bass.muted &&
+    !trackStates.other.muted &&
+    !anySoloActive;
+  const isVocalSoloActive = trackStates.vocals.solo;
+  const isAllNormal =
+    !trackStates.vocals.muted &&
+    !trackStates.drums.muted &&
+    !trackStates.bass.muted &&
+    !trackStates.other.muted &&
+    !anySoloActive;
 
   // Se o usuário estiver na tela de Estúdio / Mixer Multitrack
   return (
@@ -1004,7 +1308,7 @@ export default function App() {
       <input
         ref={replaceAudioInputRef}
         type="file"
-        accept="audio/*"
+        accept=".mp3,.wav,.m4a,.aac,.ogg,.flac,.webm,audio/*"
         onChange={(e) => handleLocalFileUpload(e, activeSong.id)}
         className="hidden"
       />
@@ -1029,7 +1333,7 @@ export default function App() {
         </div>
       )}
 
-      {/* HUD Superior Desktop com Dropdown de Tons e Botão Catálogo */}
+      {/* HUD Superior Desktop */}
       <HeaderHUD
         activeSong={activeSong}
         currentChordObj={currentChordObj}
@@ -1076,24 +1380,26 @@ export default function App() {
       />
 
       {/* Banner Informativo Se for Faixa Sintética do YouTube sem Arquivo MP3 */}
-      {activeSong.id.startsWith('yt-') && !activeSong.customStems && (
-        <div className="bg-amber-950/30 border-b border-amber-500/30 px-3 py-1.5 flex items-center justify-between gap-2 text-xs text-amber-200 shrink-0">
-          <div className="flex items-center gap-1.5 truncate">
-            <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-            <span className="truncate">
-              Faixa importada do YouTube em prévia multitrack. Deseja separar o áudio REAL do seu arquivo MP3?
-            </span>
+      {activeSong.id.startsWith('yt-') &&
+        !activeSong.customStems &&
+        !inMemoryStemsCache.has(activeSong.id) && (
+          <div className="bg-amber-950/30 border-b border-amber-500/30 px-3 py-1.5 flex items-center justify-between gap-2 text-xs text-amber-200 shrink-0">
+            <div className="flex items-center gap-1.5 truncate">
+              <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+              <span className="truncate">
+                Prévia sintética do YouTube. Envie o MP3 para isolar a voz e instrumentos reais:
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => replaceAudioInputRef.current?.click()}
+              className="px-2.5 py-0.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/50 text-[11px] font-bold flex items-center gap-1 shrink-0 transition-colors"
+            >
+              <Upload className="w-3 h-3" />
+              <span>Enviar MP3 Real</span>
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={() => replaceAudioInputRef.current?.click()}
-            className="px-2.5 py-0.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/50 text-[11px] font-bold flex items-center gap-1 shrink-0 transition-colors"
-          >
-            <Upload className="w-3 h-3" />
-            <span>Enviar MP3 Real</span>
-          </button>
-        </div>
-      )}
+        )}
 
       {/* Corpo Principal do Estúdio */}
       <div className="flex-1 flex flex-col lg:flex-row min-h-0 overflow-hidden">
@@ -1120,7 +1426,7 @@ export default function App() {
           />
         )}
 
-        {/* Área Central: Acordes + 5 Faixas */}
+        {/* Área Central: Acordes + Barra Rápida de Isolamento + 5 Faixas */}
         <main className="flex-1 flex flex-col p-2 sm:p-3 gap-2 min-w-0 min-h-0 overflow-hidden justify-start">
           {/* Painel de Seções e Acordes */}
           <div className={`${mobileTab === 'chords' ? 'block' : 'hidden'} lg:block`}>
@@ -1140,12 +1446,91 @@ export default function App() {
             />
           </div>
 
-          {/* Multitrack Mixer: 5 Faixas (Vocais, Bateria, Baixo, Harmonia, Smart Metrônomo) */}
+          {/* Multitrack Mixer: Barra de Atalhos 1-Toque + 5 Faixas */}
           <div
             className={`${
               mobileTab === 'mixer' ? 'flex' : 'hidden'
-            } lg:flex flex-col justify-start gap-2 flex-1 min-h-0`}
+            } lg:flex flex-col justify-start gap-1.5 sm:gap-2 flex-1 min-h-0`}
           >
+            {/* Barra de Atalhos Rápidos de Isolamento e Metrônomo (Visível no Mobile e Desktop) */}
+            <div className="shrink-0 flex items-center justify-between gap-1.5 overflow-x-auto no-scrollbar bg-[#101714] border border-emerald-950/80 rounded-xl px-2.5 py-1.5">
+              <div className="flex items-center gap-1.5 shrink-0">
+                <span className="text-[10px] uppercase tracking-wider font-bold text-slate-400 mr-0.5 hidden sm:inline">
+                  Isolamento Rápido:
+                </span>
+
+                <button
+                  type="button"
+                  onClick={() => applyMixPreset(isKaraokeActive ? 'reset' : 'no-vocals')}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 border transition-all active:scale-95 ${
+                    isKaraokeActive
+                      ? 'bg-rose-600 text-white border-rose-400 shadow-md shadow-rose-600/25'
+                      : 'bg-[#16211C] hover:bg-slate-800 text-slate-200 border-slate-700/80'
+                  }`}
+                >
+                  <VolumeX className="w-3.5 h-3.5 text-rose-400" />
+                  <span>Remover Voz (Karaokê)</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => applyMixPreset(isVocalSoloActive ? 'reset' : 'only-vocals')}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 border transition-all active:scale-95 ${
+                    isVocalSoloActive
+                      ? 'bg-amber-400 text-slate-950 border-amber-300 shadow-md shadow-amber-400/25'
+                      : 'bg-[#16211C] hover:bg-slate-800 text-slate-200 border-slate-700/80'
+                  }`}
+                >
+                  <Mic className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Só Voz</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => applyMixPreset(trackStates.drums.muted ? 'reset' : 'no-drums')}
+                  className={`px-2 py-1 rounded-lg text-[11px] font-semibold border transition-all active:scale-95 ${
+                    trackStates.drums.muted && !anySoloActive
+                      ? 'bg-rose-500/25 text-rose-300 border-rose-500/50'
+                      : 'bg-[#16211C] hover:bg-slate-800 text-slate-300 border-slate-800'
+                  }`}
+                >
+                  Sem Bateria
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => applyMixPreset(trackStates.other.muted ? 'reset' : 'no-guitar')}
+                  className={`px-2 py-1 rounded-lg text-[11px] font-semibold border transition-all active:scale-95 ${
+                    trackStates.other.muted && !anySoloActive
+                      ? 'bg-rose-500/25 text-rose-300 border-rose-500/50'
+                      : 'bg-[#16211C] hover:bg-slate-800 text-slate-300 border-slate-800'
+                  }`}
+                >
+                  Sem Harmonia
+                </button>
+
+                {!isAllNormal && (
+                  <button
+                    type="button"
+                    onClick={() => applyMixPreset('reset')}
+                    className="px-2 py-1 rounded-lg text-[11px] font-bold bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 flex items-center gap-1 transition-all active:scale-95"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    <span>Mix Completa</span>
+                  </button>
+                )}
+              </div>
+
+              <button
+                type="button"
+                onClick={handleSyncMetronomeHere}
+                title="Alinha a batida 1 do metrônomo exatamente ao momento atual da música"
+                className="px-2.5 py-1 rounded-lg text-[10px] font-bold bg-slate-800/90 hover:bg-slate-700 text-emerald-300 border border-emerald-500/30 shrink-0 transition-all active:scale-95"
+              >
+                Alinhar Clique Aqui
+              </button>
+            </div>
+
             {STEM_CONFIG.map((stem) => {
               const st = trackStates[stem.key];
               const isAudible = anySoloActive ? st.solo : !st.muted;

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useRef, useEffect } from 'react';
 import { Repeat } from 'lucide-react';
 import { ChordDiagram } from './ChordDiagram';
 
@@ -16,6 +16,26 @@ export const ChordProgressionBar = ({
   showChordInspector,
   formatTime
 }) => {
+  const scrollContainerRef = useRef(null);
+  const activeButtonRef = useRef(null);
+
+  // Auto-scroll horizontal automático para manter o acorde atual sempre visível e centralizado
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    const activeBtn = activeButtonRef.current;
+    if (!container || !activeBtn) return;
+
+    const containerWidth = container.clientWidth;
+    const btnLeft = activeBtn.offsetLeft;
+    const btnWidth = activeBtn.offsetWidth;
+    const targetScrollLeft = Math.max(0, btnLeft - containerWidth / 2 + btnWidth / 2);
+
+    container.scrollTo({
+      left: targetScrollLeft,
+      behavior: 'smooth'
+    });
+  }, [activeChordIndex]);
+
   return (
     <div className="shrink-0 bg-[#101714] border border-emerald-950/90 rounded-xl p-2 sm:p-2.5 space-y-2">
       {/* Barra de Seções e Compasso */}
@@ -24,7 +44,7 @@ export const ChordProgressionBar = ({
           <span className="text-[10px] uppercase tracking-wider text-slate-400 font-semibold mr-1">
             Seções:
           </span>
-          {activeSong.sections.map((sec) => {
+          {(activeSong.sections || []).map((sec) => {
             const isCurrentSec = currentTime >= sec.start && currentTime < sec.end;
             const isLoopingThis =
               loopRange.enabled &&
@@ -81,7 +101,7 @@ export const ChordProgressionBar = ({
                 className={`w-4 h-4 rounded text-[10px] font-bold flex items-center justify-center transition-all ${
                   isPlaying && currentBeatNumber === b
                     ? b === 1
-                      ? 'bg-emerald-400 text-slate-950'
+                      ? 'bg-emerald-400 text-slate-950 scale-110'
                       : 'bg-emerald-500/30 text-emerald-200'
                     : 'bg-slate-800 text-slate-500'
                 }`}
@@ -93,30 +113,44 @@ export const ChordProgressionBar = ({
         </div>
       </div>
 
-      {/* Grade de Acordes Sincronizados + Inspetor Visual */}
+      {/* Grade de Acordes Sincronizados com Auto-Scroll + Inspetor Visual */}
       <div className="flex items-center justify-between gap-2">
-        <div className="flex-1 flex items-center gap-1.5 overflow-x-auto py-0.5 no-scrollbar">
+        <div
+          ref={scrollContainerRef}
+          className="relative flex-1 flex items-center gap-1.5 overflow-x-auto py-0.5 no-scrollbar scroll-smooth"
+        >
           {transposedChords.map((item, idx) => {
             const isActive = idx === activeChordIndex;
             const isPast = idx < activeChordIndex;
+            const chordProgress = isActive && item.duration > 0
+              ? Math.max(0, Math.min(100, ((currentTime - item.time) / item.duration) * 100))
+              : 0;
+
             return (
               <button
                 type="button"
+                ref={isActive ? activeButtonRef : null}
                 key={`${item.time}-${idx}`}
                 onClick={() => onSeek(item.time)}
-                className={`shrink-0 min-w-[58px] px-2 py-1 rounded-lg border text-left transition-all ${
+                className={`relative overflow-hidden shrink-0 min-w-[66px] px-2.5 py-1.5 rounded-lg border text-left transition-all ${
                   isActive
-                    ? 'bg-gradient-to-br from-emerald-500/25 to-green-600/20 border-emerald-400'
+                    ? 'bg-gradient-to-br from-emerald-500/25 to-green-600/20 border-emerald-400 shadow-md shadow-emerald-950/50 scale-[1.03]'
                     : isPast
                     ? 'bg-[#121916]/60 border-slate-800/50 opacity-50'
-                    : 'bg-[#141D19] border-slate-800'
+                    : 'bg-[#141D19] border-slate-800 hover:border-slate-700'
                 }`}
               >
+                {isActive && (
+                  <div
+                    className="absolute bottom-0 left-0 h-[2.5px] bg-emerald-400 transition-all duration-75"
+                    style={{ width: `${chordProgress}%` }}
+                  />
+                )}
                 <div className="text-[9px] font-mono text-slate-400 leading-none">
-                  C{idx + 1} • {formatTime(item.time)}
+                  {formatTime(item.time)}
                 </div>
                 <div
-                  className={`text-xs sm:text-sm font-bold tracking-tight ${
+                  className={`text-xs sm:text-sm font-black tracking-tight mt-0.5 ${
                     isActive ? 'text-emerald-300' : 'text-slate-200'
                   }`}
                 >
